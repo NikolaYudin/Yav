@@ -1,5 +1,5 @@
 /* ==========================================================================
- * "YAV: Zabytye Byliny" (YAV: Forgotten Epic Tales) - Windows test build v0.2
+ * "YAV: Zabytye Byliny" (YAV: Forgotten Epic Tales) - Windows test build v0.3
  * --------------------------------------------------------------------------
  * Fixed window 640x480. Flow:
  *   Launch screen -> Character select (Bogatyr/Strelek/Volkhv) -> World
@@ -7,11 +7,17 @@
  * Real-time autosave: every action (choice, nickname, movement, quest step)
  * is written to yav_profile.json immediately (atomic write via temp+rename).
  *
- * New in v0.2: small village scene with an oak tree in the center and the
+ * v0.2: small village scene with an oak tree in the center and the
  * NPC "Cat the Scholar" (Kot Ucheny) who greets the hero and gives the
  * first quest ("Greet the scholar cat" -> "Collect 3 acorns near the oak").
- * Walk with arrow keys / WASD, talk to the cat with E when nearby.
  *
+ * v0.3 controls:
+ *   - Mouse-to-walk: left-click anywhere on the ground and the hero walks
+ *     there automatically (collision-aware: huts, well, oak trunk, bounds).
+ *     Arrow keys / WASD still work as manual override.
+ *   - Ability hotbar (keys 1..4): class-specific skills with energy cost,
+ *     cooldown sweep animation and countdown; passive energy regen (+1/2s);
+ *     HP + energy bars in HUD; ESC returns to menu.
  * Architecture note (mirrors Unity project): logic (stats, quest state,
  * persistence) is separated from rendering; later this exact state model
  * moves behind a server-authoritative network layer.
@@ -20,6 +26,7 @@
 #define WINVER 0x0A00
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
+#include <windowsx.h>   /* GET_X_LPARAM / GET_Y_LPARAM for mouse-to-walk */
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -80,7 +87,7 @@ static const wchar_t* B_CONT    = L"\x041f\x0420\x041e\x0414\x041e\x041b\x0416\x
 static const wchar_t* B_NEW     = L"\x041d\x041e\x0412\x042b\x0419 \x0413\x0415\x0420\x041e\x0419";
 
 /* --- World / village strings --- */
-static const wchar_t* W_HINT    = L"\x041f\x0435\x0440\x0435\x043c\x0435\x0449\x0435\x043d\x0438\x0435: \x0421\x0422\x0420\x0415\x041b\x041a\x0418 / WASD. \x0413\x043e\x0432\x043e\x0440\x0438\x0442\x044c: E";
+static const wchar_t* W_HINT    = L"\x041a\x043b\x0438\x043a \x041b\x041c\x041c \x2014 \x0438\x0434\x0442\x0438 \x043a \x0442\x043e\x0447\x043a\x0435. E \x2014 \x0433\x043e\x0432\x043e\x0440/\x043f\x043e\x0434\x0431\x043e\x0440. 1-4 \x2014 \x0443\x043c\x0435\x043d\x0438\x044f";
 static const wchar_t* CAT_NAME  = L"\x041a\x043e\x0442 \x0423\x0447\x0451\x043d\x044b\x0439";
 static const wchar_t* CAT_GREET = L"\x041c\x044f\x0443! \x0414\x043e\x0431\x0440\x043e \x043f\x043e\x0436\x0430\x043b\x043e\x0432\x0430\x0442\x044c, %ls, \x0431\x044b\x043b\x0438\x043d\x0443\x0448\x0430!";
 static const wchar_t* CAT_QUEST = L"\x042f \x043a\x043e\x0442 \x0423\x0447\x0451\x043d\x044b\x0439, \x0445\x0440\x0430\x043d\x0438\x0442\x0435\x043b\x044c \x044d\x0442\x043e\x0439 \x0434\x0435\x0440\x0435\x0432\x043d\x0438. \x041f\x043e\x043a\x0430 \x043f\x0435\x0440\x0441\x0442\x043e \x043f\x043e\x0434 \x0434\x0443\x0431\x043e\x043c \x2014 \x0436\x0435\x043b\x0443\x0434\x0438 \x0434\x0443\x0431\x043e\x0432\x044b\x0435 \x0436\x0435\x043b\x0443\x0434\x0438! \x0421\x043e\x0431\x0435\x0440\x0438 3 \x0436\x0435\x043b\x0443\x0434\x044f \x0432\x043e\x0437\x043b\x0435 \x0434\x0443\x0431\x0430 (\x043f\x043e\x0434\x043e\x0439\x0434\x0438 \x043a \x043d\x0438\x043c \x0438 \x043d\x0430\x0436\x043c\x0438 \x0415).";
@@ -106,6 +113,10 @@ static HFONT g_fBig, g_fMed, g_fSmall, g_fTitle;
 
 /* forward decls */
 static void DrawFrameAt(HDC hdc, RECT r, COLORREF c);
+static void ShowDialog(const wchar_t* fmt, ...);
+static void DrawAbilityBar(HDC hdc);
+static int  BlockedAt(int nx, int ny);
+static void CastAbility(HWND hwnd, int slot);
 static void SaveProfile(void);
 static wchar_t q_buf[128];
 
@@ -122,6 +133,15 @@ static wchar_t g_dialogText[512];
 static ULONGLONG g_lastSave = 0;
 static ULONGLONG g_saveFlashUntil = 0;        /* show "saved" indicator briefly */
 
+/* Mouse-to-walk destination (click where to go) */
+static int g_walkDestSet = 0;
+static int g_walkX = 0, g_walkY = 0;
+
+/* Energy / buffs for the ability hotbar (keys 1..4) */
+static int  g_energyCur = 60, g_energyMax = 60;
+static ULONGLONG g_buffUntil = 0;             /* damage buff expiry */
+static ULONGLONG g_lastRegen = 0;             /* passive energy regen tick */
+
 /* Acorns under the oak (fixed positions, respawn per session only) */
 typedef struct { int x, y, taken; } Acorn;
 static Acorn g_acorns_arr[3] = { {262,196,0}, {352,214,0}, {300,252,0} };
@@ -132,6 +152,72 @@ static Acorn g_acorns_arr[3] = { {262,196,0}, {352,214,0}, {300,252,0} };
 #define CAT_Y 236
 #define PICK_R 26
 #define TALK_R 46
+#define WALK_SPEED 5      /* px per tick (tick = 50 ms) -> ~100 px/s */
+#define NABILITY 4
+
+/* ----------------------------- Abilities ---------------------------------- */
+enum { AB_DMG = 0, AB_HEAL, AB_BUFF, AB_PICK };
+typedef struct {
+    const wchar_t* name;
+    const wchar_t* tag;   /* short effect line for the bar */
+    int cost;             /* energy */
+    int power;
+    ULONGLONG cd;         /* cooldown ms; <1000 => "basic attack", no cooldown */
+    int kind;
+    ULONGLONG cdUntil;    /* runtime only */
+    ULONGLONG lastCast;   /* runtime only */
+} Ability;
+static Ability g_ab[NABILITY];
+
+static void BuildAbilities(void)
+{
+    int i, dmg = 12;
+    for (i = 0; i < NABILITY; i++) { memset(&g_ab[i], 0, sizeof(Ability)); }
+    g_ab[0].name = L"\x0423\x0434\x0430\x0440";            /* Удар (basic) */
+    g_ab[0].tag  = L"-\x0416";                              /* -Ж */
+    g_ab[0].kind = AB_DMG; g_ab[0].cost = 0; g_ab[0].cd = 400;
+    g_ab[1].name = L"\x041a\x043b\x044f\x0442\x0432\x0430"; /* Клятва / Стрела / Гнев — class slot 2 */
+    g_ab[1].kind = AB_DMG; g_ab[1].cd = 8000;
+    g_ab[2].name = L""; g_ab[2].kind = AB_HEAL; g_ab[2].cd = 15000;
+    g_ab[3].name = L"\x0417\x043e\x0440\x044e";            /* Зорю (universal utility: pick acorns at range) */
+    g_ab[3].tag  = L"+\x0416\x0435\x043b";                 /* +Жел */
+    g_ab[3].kind = AB_PICK; g_ab[3].cost = 10; g_ab[3].power = 0; g_ab[3].cd = 3000;
+    switch (g_selected) {
+        case 0: /* Богатырь */
+            dmg = 18;
+            g_ab[1].tag = L"-27 \x043f\x043e \x0432\x0441\x0435\x043c"; /* AoE flavor */
+            g_ab[1].cost = 20; g_ab[1].power = 27;
+            g_ab[2].name = L"\x041a\x043b\x044f\x0442\x0432\x0430 \x0411\x043e\x0433\x0430"; /* Клятва Бога */
+            g_ab[2].tag  = L"+40 \x0416";
+            g_ab[2].cost = 25; g_ab[2].power = 40;
+            break;
+        case 1: /* Стрелок */
+            dmg = 24;
+            g_ab[1].name = L"\x0422\x043e\x0447\x043d\x044b\x0439 \x0412\x044b\x0441\x0442\x0440\x0435\x043b"; /* Точный Выстрел */
+            g_ab[1].tag  = L"-36";
+            g_ab[1].cost = 15; g_ab[1].power = 36;
+            g_ab[2].name = L"\x0412\x0435\x0442\x0435\x0440";  /* Ветер: buff +50% dmg */
+            g_ab[2].tag  = L"+50% \x0443\x0440\x043e\x043d";
+            g_ab[2].kind = AB_BUFF; g_ab[2].cost = 20; g_ab[2].power = 0; g_ab[2].cd = 20000;
+            break;
+        case 2: /* Волхв */
+            dmg = 14;
+            g_ab[1].name = L"\x041e\x0433\x043d\x0435\x043d\x044c"; /* Огонёк */
+            g_ab[1].tag  = L"-30";
+            g_ab[1].cost = 25; g_ab[1].power = 30;
+            g_ab[2].name = L"\x0427\x0443\x0440\x0430";     /* Чур: heal + shield flavor */
+            g_ab[2].tag  = L"+30 \x0416";
+            g_ab[2].cost = 30; g_ab[2].power = 30;
+            break;
+        default: break;
+    }
+    g_ab[0].power = dmg;
+    {
+        static wchar_t t0[8];
+        swprintf(t0, 8, L"-%d", dmg);
+        g_ab[0].tag = t0;
+    }
+}
 
 /* --------------------------- File DB (real time) ------------------------- */
 static void ProfilePathW(wchar_t* out, size_t cch)
@@ -174,17 +260,18 @@ static void SaveProfile(void)
     if (!f) return;
     fprintf(f,
         "{\n"
-        "  \"version\": 2,\n"
+        "  \"version\": 3,\n"
         "  \"updatedAt\": \"%s\",\n"
         "  \"nickname\": \"%s\",\n"
         "  \"classId\": %d,\n"
         "  \"hp\": %d,\n"
         "  \"hpMax\": %d,\n"
+        "  \"energy\": %d,\n"
         "  \"pos\": { \"x\": %d, \"y\": %d },\n"
         "  \"quest\": { \"step\": %d, \"acorns\": %d, \"catTalked\": %s },\n"
         "  \"acornTaken\": [%d, %d, %d]\n"
         "}\n",
-        stamp, nutf, g_selected, g_hpCur, g_hpMax, g_px, g_py,
+        stamp, nutf, g_selected, g_hpCur, g_hpMax, g_energyCur, g_px, g_py,
         g_questStep, g_acorns, g_catTalked ? "true" : "false",
         g_acorns_arr[0].taken, g_acorns_arr[1].taken, g_acorns_arr[2].taken);
     fclose(f);
@@ -257,6 +344,9 @@ static int LoadProfile(void) /* returns 1 if a valid profile was loaded */
         g_selected   = JsonGetInt(buf, "classId", -1);
         g_hpMax      = JsonGetInt(buf, "hpMax", g_class[g_selected >= 0 && g_selected < NCLASS ? g_selected : 0].hp);
         g_hpCur      = JsonGetInt(buf, "hp", g_hpMax);
+        g_energyMax  = (g_selected >= 0 && g_selected < NCLASS) ? g_class[g_selected].energy : 60;
+        g_energyCur  = JsonGetInt(buf, "energy", g_energyMax);
+        if (g_energyCur > g_energyMax) g_energyCur = g_energyMax;
         g_px         = JsonGetInt(buf, "x", 320);
         g_py         = JsonGetInt(buf, "y", 380);
         g_questStep  = JsonGetInt(buf, "step", 0);
@@ -569,10 +659,16 @@ static void PaintWorld(HDC hdc)
         RectFill(hdc, bx + 70, by, 120, 10, RGB(0x33,0x1a,0x1a));
         RectFill(hdc, bx + 70, by, (int)(120.0 * g_hpCur / (g_hpMax?g_hpMax:1)), 10, RGB(0xC0,0x3A,0x3A));
         DrawFrame(hdc, (RECT){bx+70,by,bx+190,by+10}, RGB(0x88,0x66,0x44));
+        /* energy bar under HP */
+        RectFill(hdc, bx + 70, by + 12, 120, 6, RGB(0x14,0x20,0x38));
+        RectFill(hdc, bx + 70, by + 12, (int)(120.0 * g_energyCur / (g_energyMax?g_energyMax:1)), 6, RGB(0x3A,0x7A,0xC8));
         swprintf(q_buf, sizeof(q_buf)/sizeof(wchar_t), L"%ls: %d/3", T_ACORN, g_acorns);
         TextC(hdc, 240, by - 2, q_buf, RGB(0xFF,0xE9,0x7A), g_fSmall, 0);
     }
-    TextC(hdc, WIN_W/2, 462, W_HINT, RGB(0xD8,0xD0,0xB8), g_fSmall, 1);
+    DrawAbilityBar(hdc);
+    if (GetTickCount64() < g_buffUntil)
+        TextC(hdc, 250, 432, L"\x0411\x0430\x0444\x0444: +50% \x0443\x0440\x043e\x043d", RGB(0x9A,0xE0,0x9A), g_fSmall, 0);
+    TextC(hdc, WIN_W/2, 424, W_HINT, RGB(0xD8,0xD0,0xB8), g_fSmall, 1);
 
     DrawDialogBox(hdc);
     DrawQuestTracker(hdc);
@@ -745,7 +841,9 @@ static void LayoutForScreen(HWND hwnd)
 /* ----------------------------- Interaction -------------------------------- */
 static void EnterWorld(HWND hwnd)
 {
+    BuildAbilities(); /* class-dependent hotbar */
     g_screen = SCR_WORLD;
+    SetTimer(hwnd, 2, 50, NULL);   /* mouse-walk / regen tick */
     LayoutForScreen(hwnd);
     SetFocus(hwnd);
     SaveProfile(); /* real-time: entering the world is persisted instantly */
@@ -811,29 +909,137 @@ static void TalkCat(HWND hwnd)
     ShowDialog(L"\x041c\x044f\x0443! \x0417\x0430\x0433\x043b\x044f\x043d\x044f\x0439 \x0431\x044b\x043b\x0438\x043d\x0443 \x0437\x0430\x043f\x0438\x0441\x0430\x043d\x0430.", L"");
 }
 
+/* Collision test for a single point (shared by keyboard and mouse movement) */
+static int BlockedAt(int nx, int ny)
+{
+    if (nx < 14 || nx > WIN_W - 14) return 1;
+    if (ny < 96  || ny > WIN_H - 40) return 1;
+    if (abs(nx - OAK_X) < 16 && ny > OAK_Y && ny < OAK_Y + 50) return 1; /* trunk */
+    if (nx > 40 && nx < 136 && ny > 120 && ny < 200) return 1;            /* hut1 */
+    if (nx > 500 && nx < 600 && ny > 118 && ny < 200) return 1;           /* hut2 */
+    if (nx > 150 && nx < 190 && ny > 250 && ny < 276) return 1;           /* well */
+    return 0;
+}
+
 static void MovePlayer(HWND hwnd, int dx, int dy)
 {
     int nx = g_px + dx, ny = g_py + dy;
-    /* simple collision: oak trunk + huts + bounds */
-    if (nx < 14) nx = 14;
-    if (nx > WIN_W - 14) nx = WIN_W - 14;
-    if (ny < 96) ny = 96;
-    if (ny > WIN_H - 40) ny = WIN_H - 40;
-    if (abs(nx - OAK_X) < 16 && ny > OAK_Y && ny < OAK_Y + 50) { /* trunk */ }
-    else if (nx > 40 && nx < 136 && ny > 120 && ny < 200) { /* hut1 */ }
-    else if (nx > 500 && nx < 600 && ny > 118 && ny < 200) { /* hut2 */ }
-    else if (nx > 150 && nx < 190 && ny > 250 && ny < 276) { /* well */ }
-    else { g_px = nx; g_py = ny; }
+    if (!BlockedAt(nx, ny)) { g_px = nx; g_py = ny; }
+    g_walkDestSet = 0; /* manual keys cancel the mouse walk order */
     /* real-time throttled autosave (every 2s while moving) */
     if (GetTickCount64() - g_lastSave > 2000) SaveProfile();
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
+/* Mouse-driven walking: LMB sets destination, hero walks there each tick */
+static void WalkToward(HWND hwnd)
+{
+    double dx, dy, d;
+    if (!g_walkDestSet) return;
+    dx = g_walkX - g_px; dy = g_walkY - g_py;
+    d = sqrt(dx * dx + dy * dy);
+    if (d < WALK_SPEED) { g_px = g_walkX; g_py = g_walkY; g_walkDestSet = 0; }
+    else {
+        int nx = g_px + (int)(dx / d * WALK_SPEED);
+        int ny = g_py + (int)(dy / d * WALK_SPEED);
+        if (BlockedAt(nx, ny)) { g_walkDestSet = 0; } /* obstacle: stop */
+        else { g_px = nx; g_py = ny; }
+    }
+    if (GetTickCount64() - g_lastSave > 2000) SaveProfile();
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* ------------------------------- Abilities -------------------------------- */
+static void CastAbility(HWND hwnd, int slot)
+{
+    ULONGLONG now = GetTickCount64();
+    Ability* ab;
+    int r, dmg, i;
+    if (slot < 0 || slot >= NABILITY || g_selected < 0) return;
+    ab = &g_ab[slot];
+    if (ab->cd > 1000 && now < ab->cdUntil) return;      /* on cooldown */
+    if (g_energyCur < ab->cost) {                        /* not enough energy */
+        ShowDialog(L"\x041c\x0430\x043b\x043e \x044d\x043d\x0435\x0440\x0433\x0438\x0438! \x041f\x043e\x0434\x043e\x0436\x0434\x0438 \x043a \x043a\x043e\x0442\x0443 \x2014 \x043e\x043d \x043d\x0430\x043b\x0438\x0442.", L"");
+        return;
+    }
+    g_energyCur -= ab->cost;
+    ab->lastCast = now;
+    if (ab->cd > 1000) ab->cdUntil = now + ab->cd;
+
+    switch (ab->kind) {
+        case AB_HEAL:
+            r = ab->power;
+            if (g_hpCur < g_hpMax) g_hpCur += r; if (g_hpCur > g_hpMax) g_hpCur = g_hpMax;
+            if (g_energyCur < g_energyMax) g_energyCur += 10; if (g_energyCur > g_energyMax) g_energyCur = g_energyMax;
+            break;
+        case AB_BUFF:
+            g_buffUntil = now + 8000; /* +50% damage for 8 s */
+            break;
+        case AB_PICK:
+            for (i = 0; i < 3; i++) {
+                int ddx = g_px - g_acorns_arr[i].x, ddy = g_py - g_acorns_arr[i].y;
+                if (!g_acorns_arr[i].taken && sqrt((double)(ddx*ddx+ddy*ddy)) < PICK_R + 36) {
+                    g_acorns_arr[i].taken = 1; g_acorns++;
+                    if (g_questStep == 2 && g_acorns >= 3) g_questStep = 3;
+                    break;
+                }
+            }
+            break;
+        case AB_DMG: default:
+            dmg = ab->power;
+            if (now < g_buffUntil) dmg = dmg * 3 / 2;
+            r = g_hpCur - dmg; if (r < 0) r = 0; g_hpCur = r;
+            break;
+    }
+    SaveProfile(); /* real-time: ability use is persisted instantly */
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+static void DrawAbilityBar(HDC hdc)
+{
+    static const wchar_t* AB_KEY[4] = { L"1", L"2", L"3", L"4" };
+    ULONGLONG now = GetTickCount64();
+    int bx = 250, by = 444, bw = 88, gap = 6, i;
+    for (i = 0; i < NABILITY; i++) {
+        Ability* ab = &g_ab[i];
+        RECT r = { bx + i * (bw + gap), by, bx + i * (bw + gap) + bw, by + 30 };
+        ULONGLONG left = 0;
+        HBRUSH b;
+        int ready = !(ab->cd > 1000 && now < ab->cdUntil) && g_energyCur >= ab->cost;
+        b = CreateSolidBrush(ready ? RGB(0x2A,0x30,0x44) : RGB(0x18,0x1A,0x24));
+        FillRect(hdc, &r, b); DeleteObject(b);
+        DrawFrame(hdc, r, ready ? RGB(0xC8,0x9A,0x3E) : RGB(0x55,0x50,0x44));
+        /* cooldown sweep overlay */
+        if (ab->cd > 1000 && now < ab->cdUntil) {
+            RECT cr = r;
+            left = ab->cdUntil - now;
+            cr.left = r.left + (LONG)((double)(r.right - r.left) * (1.0 - (double)left / ab->cd));
+            b = CreateSolidBrush(RGB(0x10,0x12,0x1A));
+            FillRect(hdc, &cr, b); DeleteObject(b);
+        }
+        TextC(hdc, r.left + 4,  r.top + 2, ab->name,   RGB(0xFF,0xF3,0xC0), g_fSmall, 0);
+        TextC(hdc, r.left + 4,  r.top + 16, ab->tag,   ready ? RGB(0x9A,0xAA,0xFF) : RGB(0x77,0x77,0x88), g_fSmall, 0);
+        TextC(hdc, r.right - 12, r.top + 2, AB_KEY[i], RGB(0xE8,0xC8,0x5A), g_fSmall, 0);
+        if (ab->cd > 1000 && left) {
+            wchar_t s[8]; swprintf(s, 8, L"%d", (int)((left + 999) / 1000));
+            TextC(hdc, (r.left + r.right)/2, r.top + 8, s, RGB(0xFF,0xFF,0xFF), g_fMed, 1);
+        }
+    }
+}
+
 static void AdvanceTick(HWND hwnd)
 {
-    if (g_screen == SCR_WORLD && g_dialogShown && GetTickCount64() > g_dialogUntil) {
-        g_dialogShown = 0;
-        InvalidateRect(hwnd, NULL, FALSE);
+    int changed = 0;
+    ULONGLONG now = GetTickCount64();
+    if (g_screen == SCR_WORLD) {
+        WalkToward(hwnd);
+        /* passive energy regen: +1 every 2 s up to max */
+        if (g_energyCur < g_energyMax && now - g_lastRegen >= 2000) {
+            g_energyCur++; g_lastRegen = now; changed = 1;
+        }
+        if (g_buffUntil && now > g_buffUntil) { g_buffUntil = 0; changed = 1; }
+        if (g_dialogShown && now > g_dialogUntil) { g_dialogShown = 0; changed = 1; }
+        if (changed) InvalidateRect(hwnd, NULL, FALSE);
     }
 }
 
@@ -857,7 +1063,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             for (i = 0; i < 4; i++) { HFONT f = i==0?g_fTitle:i==1?g_fBig:i==2?g_fMed:g_fSmall; (void)f; }
             (void)hi;
             hasProfile = LoadProfile();
-            SetTimer(hwnd, 1, 250, NULL); /* dialog auto-hide tick */
+            SetTimer(hwnd, 1, 250, NULL); /* dialog auto-hide tick */ SetTimer(hwnd, 2, 50, NULL); /* walk/regen tick (no-op outside world) */
             LayoutForScreen(hwnd);
             return 0;
         }
@@ -917,6 +1123,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_KEYDOWN:
             if (g_screen != SCR_WORLD) return 0;
             switch (wp) {
+                case '1': CastAbility(hwnd, 0); break;
+                case '2': CastAbility(hwnd, 1); break;
+                case '3': CastAbility(hwnd, 2); break;
+                case '4': CastAbility(hwnd, 3); break;
                 case VK_LEFT:  case 'A': MovePlayer(hwnd, -8, 0); break;
                 case VK_RIGHT: case 'D': MovePlayer(hwnd,  8, 0); break;
                 case VK_UP:    case 'W': MovePlayer(hwnd, 0, -8); break;
@@ -927,13 +1137,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     else TryPickAcorn(hwnd);
                     break; }
                 case VK_ESCAPE:
+                    KillTimer(hwnd, 2);
+                    g_walkDestSet = 0;
                     g_screen = SCR_CONTINUE; /* back to menu keeps profile */
                     LayoutForScreen(hwnd);
                     break;
             }
             return 0;
         case WM_LBUTTONDOWN:
-            if (g_screen == SCR_WORLD && g_dialogShown) { g_dialogShown = 0; InvalidateRect(hwnd, NULL, FALSE); }
+            if (g_screen == SCR_WORLD) {
+                if (g_dialogShown) { g_dialogShown = 0; InvalidateRect(hwnd, NULL, FALSE); }
+                else {
+                    /* mouse-to-walk: hero walks to the clicked point */
+                    int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+                    if (mx >= 14 && mx <= WIN_W - 14 && my >= 96 && my <= WIN_H - 40 &&
+                        !BlockedAt(mx, my)) {
+                        g_walkX = mx; g_walkY = my; g_walkDestSet = 1;
+                        InvalidateRect(hwnd, NULL, FALSE);
+                    }
+                }
+            }
             return 0;
         case WM_COMMAND:
             switch (LOWORD(wp)) {
@@ -954,6 +1177,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     int idx = LOWORD(wp) - IDC_CARD_0;
                     g_selected = idx;
                     g_hpMax = g_class[idx].hp; g_hpCur = g_class[idx].hp;
+                    g_energyMax = g_class[idx].energy; g_energyCur = g_class[idx].energy;
+                    BuildAbilities(); /* hotbar preview follows the class */
                     LayoutForScreen(hwnd); /* repaint selection */
                     break; }
                 case IDC_BTN_CHOOSE: {

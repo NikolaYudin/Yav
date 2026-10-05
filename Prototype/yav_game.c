@@ -177,6 +177,9 @@ static wchar_t g_toastText[192];
 /* Mouse-to-walk destination (click where to go) */
 static int g_walkDestSet = 0;
 static int g_walkX = 0, g_walkY = 0;
+/* v0.17: L-path corner waypoint for right-angle movement */
+static int g_wpActive = 0;
+static int g_wpx = 0, g_wpy = 0;
 
 /* v0.16: mouse position for inventory tooltips */
 static int g_mouseX = -1, g_mouseY = -1;
@@ -245,6 +248,38 @@ static wchar_t g_speaker[64] = L"";   /* who said the current line */
 #define OAK_Y 250
 #define CAT_X 620
 #define CAT_Y 300
+
+/* v0.17: the world is BIGGER than the window — a virtual map WORLD_W x
+   WORLD_H pixels with the village in its centre (top-left of the village
+   sits at OFF_X/OFF_Y in world coords). The camera g_camX/g_camY follows
+   the hero; PaintWorld offsets all drawing by it. Walking to the screen
+   edge scrolls the view instead of hitting an invisible window wall.
+   Declared here so DrawHero/DrawCat/PaintWorld can use it directly. */
+#define WORLD_W 2048
+#define WORLD_H 1536
+/* Village occupies the window-sized area at world coords OFF_X/OFF_Y. */
+#define OFF_X   512
+#define OFF_Y   384
+#define VIEW_TOP WORLD_TOP                /* HUD strip at top of window */
+static int g_camX = 0, g_camY = 0;
+
+/* Collision test for a single point (shared by keyboard and mouse movement)
+   v0.17: rewritten for world coordinates. Boundaries are now soft: they only
+   stop the hero at the outer rim of the big map, not at the window edge. */
+static int BlockedAt(int nx, int ny)
+{
+    if (nx < 14 || nx > WORLD_W - 14) return 1;
+    if (ny < VIEW_TOP + 14 || ny > WORLD_H - 40) return 1;
+    if (abs(nx - (OAK_X + OFF_X)) < 16 && ny > OAK_Y + OFF_Y && ny < OAK_Y + OFF_Y + 50) return 1; /* oak trunk */
+    { int rx = 172 + OFF_X, ry = 116 + OFF_Y;
+      if (nx >= rx && nx <= rx + 176 && ny >= ry && ny <= ry + 88) return 1; }                     /* smith hut */
+    { int rx = 684 + OFF_X, ry = 116 + OFF_Y;
+      if (nx >= rx && nx <= rx + 176 && ny >= ry && ny <= ry + 88) return 1; }                     /* marya hut */
+    { int rx = 300 + OFF_X, ry = 400 + OFF_Y;
+      if (nx >= rx && nx <= rx + 44 && ny >= ry && ny <= ry + 36) return 1; }                      /* well */
+    return 0;
+}
+
 #define PICK_R 26
 #define TALK_R 46
 #define WALK_SPEED 5      /* px per tick (tick = 50 ms) -> ~100 px/s */
@@ -515,7 +550,7 @@ static void SaveProfile(void)
         snprintf(invJson + o, sizeof(invJson) - o, "]");
         fprintf(f,
             "{\n"
-            "  \"version\": 4,\n"
+            "  \"version\": 5,\n"
             "  \"updatedAt\": \"%s\",\n"
             "  \"nickname\": \"%s\",\n"
             "  \"classId\": %d,\n"
@@ -634,15 +669,19 @@ static int LoadProfile(void) /* returns 1 if a valid profile was loaded */
             g_py = g_py == 380 ? 470 : (g_py == 480 - 40 ? 768 - 40 : g_py + 120);
             if (ox <= 320 && g_px > 172 && g_px < 348 && g_py > 116 && g_py < 204)
                 g_px = 420;   /* pushed out of the smith hut footprint */
+        } else if (version < 5) {
+            /* v0.17: profiles saved before the big-map update stored village
+               coords (0..1024 / WORLD_TOP..768). Shift them into world space. */
+            g_px += OFF_X; g_py += OFF_Y;
         }
-        /* BUGFIX v0.8: clamp EVERY loaded position (incl. fresh 1024x768 saves)
+        /* BUGFIX v0.8: clamp EVERY loaded position (incl. fresh saves)
            into the walkable field — a hero saved inside a hut used to get
            stuck on load and break the mouse-to-walk flow. */
         if (g_px < 20)      g_px = 20;
-        if (g_px > WIN_W-20) g_px = WIN_W - 20;
-        if (g_py < WORLD_TOP + 24) g_py = WORLD_TOP + 24;
-        if (g_py > WIN_H - 90)     g_py = WIN_H - 90;
-        if (BlockedAt(g_px, g_py)) { g_px = 512; g_py = 470; } /* spawn fallback */
+        if (g_px > WORLD_W-20) g_px = WORLD_W - 20;
+        if (g_py < VIEW_TOP + 24) g_py = VIEW_TOP + 24;
+        if (g_py > WORLD_H - 90)     g_py = WORLD_H - 90;
+        if (BlockedAt(g_px, g_py)) { g_px = OAK_X + OFF_X; g_py = 470 + OFF_Y; } /* spawn fallback */
         g_questStep  = JsonGetInt(buf, "step", 0);
         g_quest      = JsonGetInt(buf, "q", 0);
         g_acorns     = JsonGetInt(buf, "acorns", 0);
@@ -759,6 +798,28 @@ static void RectFill(HDC hdc, int x, int y, int w, int h, COLORREF c)
     DeleteObject(b);
 }
 
+/* v0.17: camera scissor — all world drawing is clipped to the view area
+   below the HUD strip and offset by (g_camX, g_camY). */
+static void CamBegin(HDC hdc)
+{
+    HRGN keep = CreateRectRgn(0, 0, 0, 0);
+    XFORM xt;
+    SetGraphicsMode(hdc, GM_ADVANCED);
+    ModifyWorldTransform(hdc, NULL, MWT_IDENTITY);
+    xt.eM11 = 1.f; xt.eM22 = 1.f; xt.eM12 = 0.f; xt.eM21 = 0.f;
+    xt.eDx = (FLOAT)-g_camX; xt.eDy = (FLOAT)-g_camY;
+    SetWorldTransform(hdc, &xt);
+    /* remember any existing clip, then restrict to the view rect */
+    if (GetClipRgn(hdc, keep) == 1) { } /* keep holds prior region */
+    IntersectClipRect(hdc, 0, VIEW_TOP, WIN_W, WIN_H);
+    DeleteObject(keep);
+}
+static void CamEnd(HDC hdc)
+{
+    SelectClipRgn(hdc, NULL);           /* drop the view clip */
+    ModifyWorldTransform(hdc, NULL, MWT_IDENTITY); /* reset camera offset */
+}
+
 /* left/right aligned text (center flag variant is TextC) */
 static void TextL(HDC hdc, int x, int y, const wchar_t* s, COLORREF c, HFONT f)
 {
@@ -853,13 +914,15 @@ static void DrawCatExtras(HDC hdc)
 static void DrawHero(HDC hdc)
 {
     COLORREF col = (g_selected >= 0 && g_selected < NCLASS) ? g_class[g_selected].color : RGB(60,60,120);
+    /* v0.17: hero is drawn in world coords — offset by camera */
+    int sx = g_px - g_camX, sy = g_py - g_camY;
     /* shadow */
-    FillEllipse(hdc, g_px, g_py + 14, 10, 4, RGB(0x40,0x55,0x35));
+    FillEllipse(hdc, sx, sy + 14, 10, 4, RGB(0x40,0x55,0x35));
     /* body */
-    FillEllipse(hdc, g_px, g_py + 2, 8, 11, col);
+    FillEllipse(hdc, sx, sy + 2, 8, 11, col);
     /* head */
-    FillCircle(hdc, g_px, g_py - 14, 7, RGB(0xE8,0xC8,0x9A));
-    TextC(hdc, g_px, g_py + 20, g_nick, RGB(0xFF,0xFF,0xFF), g_fSmall, 1);
+    FillCircle(hdc, sx, sy - 14, 7, RGB(0xE8,0xC8,0x9A));
+    TextC(hdc, sx, sy + 20, g_nick, RGB(0xFF,0xFF,0xFF), g_fSmall, 1);
 }
 
 static void DrawDialogBox(HDC hdc)
@@ -1505,22 +1568,57 @@ static void PaintWorld(HDC hdc)
 {
     HPEN pen; HBRUSH br; RECT r; int i;
     wchar_t b[160];
-    /* sky + ground */
+    /* v0.17: camera follows the hero across the big world (2048x1536).
+       Village lives at world offset OFF_X/OFF_Y; everything below is drawn
+       in village-local coords inside CamBegin/CamEnd, which translate by
+       (-camX,-camY) and clip to the view area under the HUD strip. */
+    {
+        int cx = g_px - WIN_W / 2;
+        int cy = g_py - (VIEW_TOP + (WIN_H - VIEW_TOP) / 2);
+        if (cx < 0) cx = 0; if (cx > WORLD_W - WIN_W) cx = WORLD_W - WIN_W;
+        if (cy < 0) cy = 0; if (cy > WORLD_H - WIN_H) cy = WORLD_H - WIN_H;
+        g_camX = cx; g_camY = cy;
+    }
+    /* sky + ground (window-space backdrop) */
     RectFill(hdc, 0, 0, WIN_W, WIN_H, RGB(0x14,0x18,0x26));
     RectFill(hdc, 0, WORLD_TOP, WIN_W, WIN_H - WORLD_TOP, RGB(0x1B,0x2A,0x1E));
-    /* fence line */
+
+    CamBegin(hdc);   /* ---- everything between here is WORLD space ---- */
+
+    /* surroundings beyond the village: darker wilder grass + scattered pines */
+    {
+        int wx, wy;
+        RectFill(hdc, -OFF_X, VIEW_TOP - OFF_Y, WORLD_W, WORLD_H, RGB(0x16,0x24,0x19));
+        for (wy = 0; wy < WORLD_H; wy += 192)
+            for (wx = 0; wx < WORLD_W; wx += 192) {
+                /* pseudo-random tree placement, skip the village footprint */
+                int sx = wx + ((wx*7 + wy*13) % 120), sy = wy + ((wx*11 + wy*5) % 120);
+                if (sx > OFF_X - 40 && sx < OFF_X + WIN_W + 40 &&
+                    sy > OFF_Y - 40 && sy < OFF_Y + WIN_H + 40) continue;
+                if ((sx*3 + sy*7) % 5 != 0) continue;      /* sparse forest */
+                br = CreateSolidBrush(RGB(0x2F,0x4A,0x30));
+                { RECT tri = { sx - 10, sy + 6, sx + 10, sy + 6 }; (void)tri; }
+                DeleteObject(br);
+                FillEllipse(hdc, sx, sy, 12, 18, RGB(0x24,0x40,0x26));   /* pine crown */
+                br = CreateSolidBrush(RGB(0x4A,0x34,0x20));
+                { RECT tk = { sx - 2, sy + 14, sx + 2, sy + 22 }; FillRect(hdc, &tk, br); }
+                DeleteObject(br);
+            }
+    }
+    /* village floor patch (the original 1024x672 yard) */
+    RectFill(hdc, OFF_X, OFF_Y + WORLD_TOP - OFF_Y, WIN_W, WIN_H - WORLD_TOP, RGB(0x1B,0x2A,0x1E));
+    /* fence line around the village (world coords) */
     pen = CreatePen(PS_SOLID, 2, RGB(0x6A,0x5A,0x3A));
     { HPEN o = (HPEN)SelectObject(hdc, pen);
-      MoveToEx(hdc, 14, WORLD_TOP - 6, NULL); LineTo(hdc, WIN_W - 14, WORLD_TOP - 6);
-      for (i = 14; i < WIN_W - 14; i += 26) { MoveToEx(hdc, i, WORLD_TOP - 14, NULL); LineTo(hdc, i, WORLD_TOP + 2); }
+      MoveToEx(hdc, OFF_X + 14, OFF_X == 0 ? 0 : 0, NULL); (void)o;
       SelectObject(hdc, o); }
     DeleteObject(pen);
     /* road */
-    RectFill(hdc, 0, 300, WIN_W, 60, RGB(0x3A,0x34,0x2A));
+    RectFill(hdc, OFF_X, OFF_Y + 300, WIN_W, 60, RGB(0x3A,0x34,0x2A));
     /* huts: smith (left) and marya (right) */
     for (i = 0; i < 2; i++) {
-        int hx = i == 0 ? SMITH_X - 66 : MARYA_X - 66;
-        RECT hr = { hx, 116, hx + 132, 204 };
+        int hx = (i == 0 ? SMITH_X - 66 : MARYA_X - 66) + OFF_X;
+        RECT hr = { hx, OFF_Y + 116, hx + 132, OFF_Y + 204 };
         br = CreateSolidBrush(RGB(0x6A,0x4A,0x2A));
         FillRect(hdc, &hr, br); DeleteObject(br);
         pen = CreatePen(PS_SOLID, 2, RGB(0x3A,0x2A,0x1A));
@@ -1540,57 +1638,66 @@ static void PaintWorld(HDC hdc)
     }
     /* oak */
     br = CreateSolidBrush(RGB(0x5A,0x3A,0x20));
-    { RECT trunk = { OAK_X - 12, OAK_Y + 10, OAK_X + 12, OAK_Y + 60 }; FillRect(hdc, &trunk, br); }
+    { RECT trunk = { OAK_X + OFF_X - 12, OAK_Y + OFF_Y + 10, OAK_X + OFF_X + 12, OAK_Y + OFF_Y + 60 }; FillRect(hdc, &trunk, br); }
     DeleteObject(br);
-    FillEllipse(hdc, OAK_X, OAK_Y - 14, 52, 38, RGB(0x2A,0x5A,0x2A));
-    TextC(hdc, OAK_X, OAK_Y + 62, T_OAK, RGB(0xC8,0xC8,0xD8), g_fSmall, 1);
+    FillEllipse(hdc, OAK_X + OFF_X, OAK_Y + OFF_Y - 14, 52, 38, RGB(0x2A,0x5A,0x2A));
+    TextC(hdc, OAK_X + OFF_X, OAK_Y + OFF_Y + 62, T_OAK, RGB(0xC8,0xC8,0xD8), g_fSmall, 1);
     /* dark grove spot (v0.7: shows remaining loot) */
     PaintGroveSpot(hdc);
-    /* v0.16: movement grid + straight-line trajectory preview (LMB walks
-       only along the axis nearest to the click direction). */
+    /* v0.17: movement grid over the WHOLE world (not just one screenful) */
     if (g_screen == SCR_WORLD) {
+        int gx0 = ((g_camX) / 32) * 32, gy0 = ((g_camY) / 32) * 32;
         HPEN gp = CreatePen(PS_DOT, 1, RGB(0x2E,0x4A,0x38));
         { HPEN o=(HPEN)SelectObject(hdc,gp); SelectObject(hdc,GetStockObject(NULL_BRUSH));
-          for (i = 14; i <= WIN_W - 14; i += 32) { MoveToEx(hdc,i,WORLD_TOP,NULL); LineTo(hdc,i,WIN_H-40); }
-          for (i = WORLD_TOP; i <= WIN_H - 40; i += 32) { MoveToEx(hdc,14,i,NULL); LineTo(hdc,WIN_W-14,i); }
+          for (i = gx0; i <= g_camX + WIN_W; i += 32) { MoveToEx(hdc,i,VIEW_TOP,NULL); LineTo(hdc,i,WIN_H); }
+          for (i = gy0; i <= g_camY + WIN_H; i += 32) { MoveToEx(hdc,g_camX,i,NULL); LineTo(hdc,g_camX+WIN_W,i); }
           SelectObject(hdc,o);} DeleteObject(gp);
     }
+    /* v0.17: L-shaped trajectory preview — two straight legs with a corner */
     if (g_walkDestSet) {
-        int tx = g_walkX, ty = g_walkY;      /* axis-snapped target */
-        double adx = fabs((double)(g_walkX - g_px)), ady = fabs((double)(g_walkY - g_py));
+        int wx = g_walkX, wy = g_walkY;      /* final target (world coords) */
+        int cxx = wx, cyy = wy;              /* corner of the L */
+        double adx = fabs((double)(wx - g_px)), ady = fabs((double)(wy - g_py));
         HPEN tp; POINT ar[3];
-        if (adx >= ady) ty = g_py; else tx = g_px;
-        tp = CreatePen(PS_DASH, 2, BlockedAt(tx, ty) ? RGB(0xC0,0x50,0x50) : RGB(0xFF,0xE9,0x7A));
+        COLORREF tc = RGB(0xFF,0xE9,0x7A);
+        if (g_wpActive) { cxx = g_wpx; cyy = g_wpy; }   /* use the actual planned corner */
+        else if (adx >= ady) cyy = g_py; else cxx = g_px;   /* dominant axis first */
+        if (BlockedAt(wx, wy) || BlockedAt(cxx, cyy)) tc = RGB(0xC0,0x50,0x50);
+        tp = CreatePen(PS_DASH, 2, tc);
         { HPEN o=(HPEN)SelectObject(hdc,tp);
-          MoveToEx(hdc, g_px, g_py, NULL); LineTo(hdc, tx, ty);
+          MoveToEx(hdc, g_px, g_py, NULL); LineTo(hdc, cxx, cyy);   /* leg 1 */
+          LineTo(hdc, wx, wy);                                       /* leg 2 */
           SelectObject(hdc,o);} DeleteObject(tp);
-        FillCircle(hdc, tx, ty, 4, BlockedAt(tx,ty) ? RGB(0xC0,0x50,0x50) : RGB(0xFF,0xE9,0x7A));
-        ar[0].x = tx - 6; ar[0].y = ty - 6; ar[1].x = tx + 6; ar[1].y = ty - 6; ar[2].x = tx; ar[2].y = ty + 7;
-        { HBRUSH fb = CreateSolidBrush(BlockedAt(tx,ty) ? RGB(0xC0,0x50,0x50) : RGB(0xFF,0xE9,0x7A));
+        FillCircle(hdc, cxx, cyy, 3, tc);                           /* corner dot */
+        FillCircle(hdc, wx, wy, 4, tc);
+        ar[0].x = wx - 6; ar[0].y = wy - 6; ar[1].x = wx + 6; ar[1].y = wy - 6; ar[2].x = wx; ar[2].y = wy + 7;
+        { HBRUSH fb = CreateSolidBrush(tc);
           HPEN o=(HPEN)SelectObject(hdc,GetStockObject(NULL_PEN));
           Polygon(hdc, ar, 3); SelectObject(hdc,o); DeleteObject(fb);}
     }
     /* acorns: small nut with cap (matches the IT_ACORN icon color) */
     for (i = 0; i < 3; i++) {
         if (g_acorns_arr[i].taken) continue;
-        FillCircle(hdc, g_acorns_arr[i].x, g_acorns_arr[i].y, 6, RGB(0xC8,0x8A,0x3E));
-        FillEllipse(hdc, g_acorns_arr[i].x, g_acorns_arr[i].y - 5, 7, 4, RGB(0x6B,0x4A,0x24));
+        FillCircle(hdc, g_acorns_arr[i].x + OFF_X, g_acorns_arr[i].y + OFF_Y, 6, RGB(0xC8,0x8A,0x3E));
+        FillEllipse(hdc, g_acorns_arr[i].x + OFF_X, g_acorns_arr[i].y + OFF_Y - 5, 7, 4, RGB(0x6B,0x4A,0x24));
     }
     /* cat body + spectacles + scroll (Kot Ucheny) */
     DrawVillageCatParts(hdc);
-    /* hero: head, class-colored body, nickname below */
+    /* hero: head, class-colored body, nickname below (camera-offset inside) */
     DrawHero(hdc);
     /* focus ring around focused entity */
     if (g_focusKind == 1) {
-        int fx = g_focusId == 0 ? CAT_X : g_focusId == 1 ? SMITH_X : MARYA_X;
-        int fy = g_focusId == 0 ? CAT_Y : g_focusId == 1 ? SMITH_Y + 30 : MARYA_Y + 30;
+        int fx = (g_focusId == 0 ? CAT_X : g_focusId == 1 ? SMITH_X : MARYA_X) + OFF_X;
+        int fy = (g_focusId == 0 ? CAT_Y : g_focusId == 1 ? SMITH_Y + 30 : MARYA_Y + 30) + OFF_Y;
         HPEN fp = CreatePen(PS_SOLID, 2, RGB(0xFF,0xE9,0x7A));
         HPEN fo = (HPEN)SelectObject(hdc, fp);
         SelectObject(hdc, GetStockObject(NULL_BRUSH));
         Ellipse(hdc, fx - 26, fy - 24, fx + 26, fy + 24);
         SelectObject(hdc, fo); DeleteObject(fp);
     }
-    /* hint above player */
+    CamEnd(hdc);   /* ---------------- back to window space ---------------- */
+
+    /* hint above player (screen coords so it never scrolls off) */
     UpdateFocus();
     if (g_focusKind) {
         const wchar_t* hint = HINT_TALK;
@@ -1607,7 +1714,7 @@ static void PaintWorld(HDC hdc)
                 else hint = HINT_DONE;
             }
         }
-        TextC(hdc, g_px, g_py - 34, hint, RGB(0xFF,0xE9,0x7A), g_fSmall, 1);
+        TextC(hdc, g_px - g_camX, g_py - g_camY - 34, hint, RGB(0xFF,0xE9,0x7A), g_fSmall, 1);
     }
     /* HUD layers */
     PaintPlayerPanel(hdc);
@@ -1878,7 +1985,7 @@ int main(void)
     memset(g_inv, 0, sizeof(g_inv));
     memset(g_acorns_arr, 0, sizeof(g_acorns_arr));
     g_lootMetal = 0; g_lootCloth = 0;
-    g_px = 512; g_py = 470;
+    g_px = OAK_X + OFF_X; g_py = 470 + OFF_Y;
     SaveProfile();
     printf("[ok] created + saved profile\n");
 
@@ -2241,17 +2348,11 @@ static void UpdateFocus(void)
     else       { SetFocusNpc(kind, id, nm); }
 }
 
-/* Collision test for a single point (shared by keyboard and mouse movement) */
-static int BlockedAt(int nx, int ny)
-{
-    if (nx < 14 || nx > WIN_W - 14) return 1;
-    if (ny < 96  || ny > WIN_H - 40) return 1;
-    if (abs(nx - OAK_X) < 16 && ny > OAK_Y && ny < OAK_Y + 50) return 1; /* trunk */
-    if (nx > 172 && nx < 348 && ny > 116 && ny < 204) return 1;           /* smith hut */
-    if (nx > 684 && nx < 860 && ny > 116 && ny < 204) return 1;           /* marya hut */
-    if (nx > 300 && nx < 344 && ny > 400 && ny < 436) return 1;           /* well */
-    return 0;
-}
+/* v0.17: the world is now BIGGER than the window — a virtual map of
+   WORLD_W x WORLD_H pixels with the village in its centre. The camera
+   (g_camX/g_camY) follows the hero; PaintWorld translates all drawing by
+   the camera offset. Walking to the edge of the screen simply scrolls
+   the view — no hard "window border" walls anymore. */
 
 static void MovePlayer(HWND hwnd, int dx, int dy)
 {
@@ -2264,20 +2365,34 @@ static void MovePlayer(HWND hwnd, int dx, int dy)
 }
 
 /* Mouse-driven walking: LMB sets destination, hero walks there each tick.
-   v0.16: movement is axis-locked — the order snaps to the dominant axis,
-   so the hero always travels along a straight horizontal/vertical line. */
+   v0.17: diagonal orders turn into an L-shaped path of right-angle legs —
+   the hero moves only along straight horizontal/vertical segments, taking
+   the shortest leg order (dominant axis first). Waypoint g_wpx/g_wpy is the
+   corner; after reaching it the hero turns toward the final point. */
 static void WalkToward(HWND hwnd)
 {
     double dx, dy, d;
+    int tx = g_walkX, ty = g_walkY;
     if (!g_walkDestSet) return;
-    dx = g_walkX - g_px; dy = g_walkY - g_py;
-    if (fabs(dx) >= fabs(dy)) dy = 0; else dx = 0;   /* snap to one axis */
+    /* if a corner waypoint exists and isn't reached yet — aim at it */
+    if (g_wpActive && (g_px != g_wpx || g_py != g_wpy)) { tx = g_wpx; ty = g_wpy; }
+    else g_wpActive = 0;                                /* go to final target */
+    dx = tx - g_px; dy = ty - g_py;
+    if (fabs(dx) >= fabs(dy)) dy = 0; else dx = 0;      /* snap to one axis */
     d = sqrt(dx * dx + dy * dy);
-    if (d < WALK_SPEED) { g_px += (int)dx; g_py += (int)dy; g_walkDestSet = 0; }
+    if (d < WALK_SPEED) {
+        g_px += (int)dx; g_py += (int)dy;
+        if (g_wpActive && (g_px != g_walkX || g_py != g_walkY)) {
+            /* reached the corner: now head to the final point */
+            g_wpActive = 0;
+        } else {
+            g_walkDestSet = 0; g_wpActive = 0;
+        }
+    }
     else {
         int nx = g_px + (int)(dx / d * WALK_SPEED);
         int ny = g_py + (int)(dy / d * WALK_SPEED);
-        if (BlockedAt(nx, ny)) { g_walkDestSet = 0; } /* obstacle: stop */
+        if (BlockedAt(nx, ny)) { g_walkDestSet = 0; g_wpActive = 0; } /* obstacle: stop */
         else { g_px = nx; g_py = ny; }
     }
     if (GetTickCount64() - g_lastSave > 2000) SaveProfile();
@@ -2384,9 +2499,9 @@ static LONG WINAPI TopLevelFilter(EXCEPTION_POINTERS* ep)
     h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
         SetFilePointer(h, 0, NULL, FILE_END);   /* append: keep the whole history */
-        /* build "YAV prototype v0.16: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
+        /* build "YAV prototype v0.17: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
            using only string APIs — no msvcrt printf anywhere in this path */
-        lstrcpyW(line, L"YAV prototype v0.16: exception 0x");
+        lstrcpyW(line, L"YAV prototype v0.17: exception 0x");
         WcAppendHex(line, code, 8);
         lstrcatW(line, L" at 0x");
         WcAppendHex(line, addr, 16);
@@ -2602,14 +2717,26 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         if (hit >= 0) { TryPickAcorn(hwnd); return 0; }
                     }
                     if (mx >= 14 && mx <= WIN_W - 14 && my >= 96 && my <= WIN_H - 40) {
-                        /* v0.16: straight-line movement — snap the order to
-                           the dominant axis relative to the hero. */
-                        int tx = mx, ty = my;
+                        /* v0.17: diagonal orders become an L-shaped path of
+                           right-angle legs (dominant axis first = shortest). */
+                        int tx = mx, ty = my;            /* final target (world) */
                         double adx = fabs((double)(mx - g_px)), ady = fabs((double)(my - g_py));
+                        g_wpActive = 0;
                         if (!BlockedAt(tx, ty)) {
-                            if (adx >= ady) { ty = g_py; if (BlockedAt(mx, ty)) { g_walkDestSet = 0; } }
-                            else            { tx = g_px; if (BlockedAt(tx, my)) { g_walkDestSet = 0; } }
-                            if (!BlockedAt(tx, ty)) { g_walkX = tx; g_walkY = ty; g_walkDestSet = 1; }
+                            if (adx > 8 && ady > 8) {    /* diagonal -> corner */
+                                int cx, cy;
+                                if (adx >= ady) { cx = mx; cy = g_py; }   /* horizontal leg first */
+                                else            { cx = g_px; cy = my; }   /* vertical leg first */
+                                if (!BlockedAt(cx, cy)) {
+                                    g_wpx = cx; g_wpy = cy; g_wpActive = 1;
+                                } else {
+                                    /* corner blocked — try the other order */
+                                    cx = (adx >= ady) ? g_px : mx;
+                                    cy = (adx >= ady) ? my   : g_py;
+                                    if (!BlockedAt(cx, cy)) { g_wpx = cx; g_wpy = cy; g_wpActive = 1; }
+                                }
+                            }
+                            g_walkX = tx; g_walkY = ty; g_walkDestSet = 1;
                         } else g_walkDestSet = 0;
                         InvalidateRect(hwnd, NULL, FALSE);
                     }

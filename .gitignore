@@ -1,6 +1,2 @@
-(empty)node_modules/
-.next/
-dist/
-build/
-*.log
-node_modules/
+# Compiled/Binary files
+*.exe

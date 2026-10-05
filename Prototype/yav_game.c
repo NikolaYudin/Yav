@@ -113,6 +113,12 @@ static HWND g_editNick = NULL;
 static HFONT g_fBig, g_fMed, g_fSmall, g_fTitle;
 
 /* forward decls */
+/* v0.12: THE safe wide formatter — see its definition for the full story.
+   Never call swprintf() directly in this file: mingw maps it to MSVCRT.DLL
+   whose size argument is counted in BYTES (UCRT counts WCHARS), so long NPC
+   lines smashed small stack buffers => fixed-address 0xC0000005 crashes.
+   SafeWfmt clamps by bytes and guarantees NUL-termination under both CRTs. */
+static void SafeWfmt(wchar_t* out, size_t capElems, const wchar_t* fmt, ...);
 static void DrawFrameAt(HDC hdc, RECT r, COLORREF c);
 static void DrawCatExtras(HDC hdc);
 static void DrawVillageCatParts(HDC hdc);
@@ -328,7 +334,7 @@ static void BuildAbilities(void)
            ("game closed right after entering the name"). Now the basic-hit
            label is generated at runtime from the global string pool. */
         wchar_t* buf = (wchar_t*)GlobalAlloc(GPTR, 16 * sizeof(wchar_t));
-        if (buf) { swprintf(buf, 16, L"-%d", dmg); g_ab[0].tag = buf; }
+        if (buf) { SafeWfmt(buf, 16, L"-%d", dmg); g_ab[0].tag = buf; }
     }
 }
 
@@ -368,14 +374,14 @@ static int IsEquipped(int id) { return id && (g_equipW == id || g_equipA == id |
    The template string with "%ls"/"%d" was then copied verbatim into the
    dialog buffer and rendered as-is — and worse, any future reformatting of
    those leftovers would dereference garbage. Every such site now pre-formats
-   its line with swprintf() into a local buffer before showing it. */
+   its line with SafeWfmt() into a local buffer before showing it. */
 static void DialogFmt(const wchar_t* tmpl, const wchar_t* a, int n)
 {
     wchar_t b[256];
     if (a && tmpl && (wcsstr(tmpl, L"%ls") || wcsstr(tmpl, L"%s")))
-        swprintf(b, 256, tmpl, a, n);
+        SafeWfmt(b, 256, tmpl, a, n);
     else if (tmpl && wcsstr(tmpl, L"%d"))
-        swprintf(b, 256, tmpl, n);
+        SafeWfmt(b, 256, tmpl, n);
     else
         lstrcpynW(b, tmpl ? tmpl : L"", 256);
     ShowDialogTop(b);
@@ -915,6 +921,56 @@ static const wchar_t* K_PROVED   = L"\x0418\x0441\x043F\x0440\x0430\x0432\x0438\
 static const wchar_t* K_CLOTH    = L"\x041F\x043E\x043B\x043E\x0442\x043D";  /* "Полотно/Полотнце" */
 static const wchar_t* K_GY       = L"\x0413\x044B\x0021";                   /* "Гы!" (smith) */
 static const wchar_t* K_TAKE     = L"\x0414\x0435\x0440\x0436\x0438\x003A";  /* "Держи:" (Marya) */
+/* BUGFIX v0.12 (crash 0xC0000005 at a fixed address in EVERY build the user
+   tested): the mingw CRT resolves the *printf family to the MSVCRT.DLL
+   version, whose buffer-size argument is counted in BYTES — but this code
+   passed it in WCHARS (like the modern UCRT).  A long NPC line (the cat's
+   greeting with the hero's nickname, quest lines...) then wrote past the end
+   of the small stack buffers (greet[320], b[256]) and smashed the saved
+   return address => access violation on function return, always at the same
+   instruction.  Every formatted wide string now goes through Wfmt(), which
+   caps the byte length itself and never trusts the caller's element count.
+   v0.12 FINAL: mingw headers map the *wprintf family to MSVCRT.DLL, whose
+   size argument is counted in BYTES (UCRT counts WCHARS).  The old code
+   passed the element count straight through => on UCRT nothing was truncated
+   at all for short buffers, and any long NPC line smashed the stack frame
+   (greet[320], b[256]) — exactly the fixed-address 0xC0000005 seen in every
+   build the user tested.  SafeWfmt() now clamps by BYTES first, then calls
+   the raw _vsnwprintf with a byte-corrected count, so it is safe under BOTH
+   CRTs.  All former swprintf() call sites were renamed to SafeWfmt(). */
+static void SafeWfmt(wchar_t* out, size_t capElems, const wchar_t* fmt, ...)
+{
+    va_list ap;
+    size_t n = capElems;
+    int wrote;
+    out[0] = 0;
+    if (!out || !fmt || n == 0) return;
+    /* v0.12 FINAL: measure the formatted length WITHOUT touching `out`.
+       If it fits into capElems-1 characters we may write it for real; if it
+       does not, we fall back to a plain bounded copy of the template (no
+       substitutions) instead of smashing the caller's stack buffer.  This is
+       correct under BOTH CRT semantics: mingw maps _vscwprintf/_vsnwprintf to
+       MSVCRT.DLL whose size argument counts BYTES (UCRT counts WCHARS), which
+       is exactly what produced the fixed-address 0xC0000005 crashes in every
+       build the user tested (long cat greeting line overflowed greet[320]). */
+    va_start(ap, fmt);
+    wrote = _vscwprintf(fmt, ap);
+    va_end(ap);
+    if (wrote < 0 || (size_t)wrote > n - 1) {
+        /* too long or failed: bounded literal copy, never past the buffer */
+        lstrcpynW(out, fmt, (int)n);
+        return;
+    }
+    va_start(ap, fmt);
+#ifdef __USE_MINGW_ANSI_STDIO
+    _vsnwprintf(out, n * sizeof(wchar_t), fmt, ap);   /* MSVCRT: bytes */
+#else
+    _vsnwprintf(out, n, fmt, ap);                     /* UCRT: wchar count */
+#endif
+    va_end(ap);
+    out[n - 1] = 0;
+}
+
 static void ShowDialogTop(const wchar_t* text)
 {
     if (!text) text = L"";
@@ -998,7 +1054,7 @@ static void PaintProfession(HWND hwnd, HDC hdc)
             s += n; while (*s == L' ') s++;
             ly += 17;
         }
-        { wchar_t kb[16]; swprintf(kb, 16, L"[\u041a\u043b\u0430\u0432\u0438\u0448\u0430 %d]", i + 1);
+        { wchar_t kb[16]; SafeWfmt(kb, 16, L"[\u041a\u043b\u0430\u0432\u0438\u0448\u0430 %d]", i + 1);
           TextC(hdc, x + w/2, y + h - 26, kb, RGB(0xE8,0xC8,0x5A), g_fSmall, 1); }
     }
     TextC(hdc, WIN_W/2, 448, B_PROFIT, RGB(0x9A,0xAA,0xC0), g_fSmall, 1);
@@ -1020,19 +1076,19 @@ static void PaintPlayerPanel(HDC hdc)
       SelectObject(hdc, o); }
     DeleteObject(pen);
     /* name + level */
-    if (g_youngster) swprintf(b, 128, L"%ls \x2014 \x043c\x043e\x043b\x043e\x0434\x0435\x0446", g_nick[0]?g_nick:L"???");
-    else             swprintf(b, 128, L"%ls \x2014 %d \x0443\x0440.", g_nick[0]?g_nick:L"???", g_level);
+    if (g_youngster) SafeWfmt(b, 128, L"%ls \x2014 \x043c\x043e\x043b\x043e\x0434\x0435\x0446", g_nick[0]?g_nick:L"???");
+    else             SafeWfmt(b, 128, L"%ls \x2014 %d \x0443\x0440.", g_nick[0]?g_nick:L"???", g_level);
     TextL(hdc, 18, 14, b, RGB(0xFF,0xE9,0x7A), g_fSmall);
     /* HP bar */
     Bar3D(hdc, 18, 36, 224, 14, (double)g_hpCur / (g_hpMax?g_hpMax:1), RGB(0xB0,0x30,0x30));
-    swprintf(b, 128, L"\x0416:%d/%d", g_hpCur, g_hpMax);
+    SafeWfmt(b, 128, L"\x0416:%d/%d", g_hpCur, g_hpMax);
     TextL(hdc, 22, 36, b, RGB(0xFF,0xFF,0xFF), g_fSmall);
     /* Energy bar */
     Bar3D(hdc, 18, 56, 224, 14, (double)g_energyCur / (g_energyMax?g_energyMax:1), RGB(0x30,0x60,0xC0));
-    swprintf(b, 128, L"\x042d:%d/%d", g_energyCur, g_energyMax);
+    SafeWfmt(b, 128, L"\x042d:%d/%d", g_energyCur, g_energyMax);
     TextL(hdc, 22, 56, b, RGB(0xFF,0xFF,0xFF), g_fSmall);
     /* acorns counter */
-    swprintf(b, 128, L"\x0416\x0435\x043b\x0443\x0434\x0438: %d/3", g_acorns);
+    SafeWfmt(b, 128, L"\x0416\x0435\x043b\x0443\x0434\x0438: %d/3", g_acorns);
     TextL(hdc, 18, 76, b, RGB(0xC8,0x8A,0x3E), g_fSmall);
 }
 
@@ -1050,9 +1106,9 @@ static void PaintFocusInfo(HDC hdc)
     }
     switch (g_focusKind) {
         case 1: /* npc */
-            swprintf(b, 128, D_FOCUS_NPC, g_focusName); break;
+            SafeWfmt(b, 128, D_FOCUS_NPC, g_focusName); break;
         case 2: /* item on ground */
-            swprintf(b, 128, D_FOCUS_ITEM, g_focusName); break;
+            SafeWfmt(b, 128, D_FOCUS_ITEM, g_focusName); break;
         default:
             if (g_focusId == 1) lstrcpynW(b, D_FOCUS_SPOT, 128);
             else                lstrcpynW(b, D_FOCUS_OAK, 128);
@@ -1090,7 +1146,7 @@ static void PaintInventory(HDC hdc)
             FillRect(hdc, &ir, br); DeleteObject(br);
             if (d->wcls || (d->id >= ITEM_HEAVY && d->id <= ITEM_MANTLE) || d->id == ITEM_AMULET)
                 DrawFrameAt(hdc, ir, RGB(0xFF,0xE9,0x7A));
-            swprintf(b, 48, L"%d", g_inv[i].count);
+            SafeWfmt(b, 48, L"%d", g_inv[i].count);
             TextR(hdc, cx + cell - 8, cy + cell - 20, b, RGB(0xFF,0xFF,0xFF), g_fSmall);
         }
     }
@@ -1107,8 +1163,8 @@ static void PaintInventory(HDC hdc)
                 br = CreateSolidBrush(RGB(0x18,0x1E,0x2E));
                 FillRect(hdc, &er, br); DeleteObject(br);
                 DrawFrameAt(hdc, er, RGB(0x4A,0x8A,0x5A));
-                if (ids[k]) swprintf(b, 64, L"%ls: %ls \x2713", labels[k], Item(ids[k])->name);
-                else        swprintf(b, 64, L"%ls: \x2014", labels[k]);
+                if (ids[k]) SafeWfmt(b, 64, L"%ls: %ls \x2713", labels[k], Item(ids[k])->name);
+                else        SafeWfmt(b, 64, L"%ls: \x2014", labels[k]);
                 TextL(hdc, er.left + 6, er.top + 6, b,
                       ids[k] ? RGB(0x9A,0xE0,0x9A) : RGB(0x7A,0x86,0x9A), g_fSmall);
             }
@@ -1133,14 +1189,14 @@ static void PaintAbilityBar(HDC hdc)
         HBRUSH br = CreateSolidBrush(RGB(0x18,0x1C,0x2A));
         FillRect(hdc, &r, br); DeleteObject(br);
         DrawFrameAt(hdc, r, RGB(0xC8,0x9A,0x3E));
-        swprintf(b, 64, L"%d", i+1);
+        SafeWfmt(b, 64, L"%d", i+1);
         TextL(hdc, r.left + 4, r.top + 2, b, RGB(0xE8,0xC8,0x5A), g_fSmall);
         if (a->name[0]) {
-            swprintf(b, 64, L"%ls", a->name);
+            SafeWfmt(b, 64, L"%ls", a->name);
             TextC(hdc, (r.left+r.right)/2, r.bottom - 18, b, RGB(0xE8,0xD8,0xA8), g_fSmall, 1);
         }
         if (a->tag[0]) {
-            swprintf(b, 64, L"%ls", a->tag);
+            SafeWfmt(b, 64, L"%ls", a->tag);
             TextC(hdc, (r.left+r.right)/2, r.top + 22, b, RGB(0xFF,0xFF,0xFF), g_fSmall, 1);
         }
         if (cdLeft > 0.0) {
@@ -1184,7 +1240,7 @@ static void PaintToast(HDC hdc)
 {
     SIZE sz; wchar_t b[224]; RECT r; HBRUSH br;
     if (!g_toastUntil || GetTickCount64() > g_toastUntil) return;
-    swprintf(b, 224, L"\x2726 %ls \x2726", g_toastText);   /* ✦ text ✦ */
+    SafeWfmt(b, 224, L"\x2726 %ls \x2726", g_toastText);   /* ✦ text ✦ */
     SetBkMode(hdc, TRANSPARENT);
     SelectObject(hdc, g_fMed);
     GetTextExtentPoint32W(hdc, b, (int)lstrlenW(b), &sz);
@@ -1302,7 +1358,7 @@ static void PaintWorld(HDC hdc)
             case 5: qtxt = Q_PROF; break;
             default: qtxt = Q_FIN; break;
         }
-        swprintf(b, 160, L"%ls %ls", Q_TITLE, qtxt);
+        SafeWfmt(b, 160, L"%ls %ls", Q_TITLE, qtxt);
         TextC(hdc, WIN_W/2, 46, b, RGB(0x9A,0xE0,0x9A), g_fSmall, 1);
     }
     /* bottom hint */
@@ -1317,9 +1373,9 @@ static void PaintContinue(HWND hwnd, HDC hdc)
     (void)hwnd;
     RectFill(hdc, 0, 0, WIN_W, WIN_H, RGB(0x10,0x14,0x20));
     TextC(hdc, WIN_W/2, 120, H_CONT1, RGB(0xE8,0xC8,0x5A), g_fMed, 1);
-    swprintf(info, 160, L"%ls \x2014 %ls", g_nick, cname);
+    SafeWfmt(info, 160, L"%ls \x2014 %ls", g_nick, cname);
     TextC(hdc, WIN_W/2, 160, info, RGB(0xFF,0xFF,0xFF), g_fBig, 1);
-    swprintf(info, 160, L"\x0416\x0438\x0437\x043d\x044c: %d/%d \x2022 \x0416\x0435\x043b\x0443\x0434\x0435\x0439: %d", g_hpCur, g_hpMax, g_acorns);
+    SafeWfmt(info, 160, L"\x0416\x0438\x0437\x043d\x044c: %d/%d \x2022 \x0416\x0435\x043b\x0443\x0434\x0435\x0439: %d", g_hpCur, g_hpMax, g_acorns);
     TextC(hdc, WIN_W/2, 196, info, RGB(0x9A,0xE0,0x9A), g_fSmall, 1);
 }
 
@@ -1432,7 +1488,7 @@ static void EnterWorld(HWND hwnd)
        to the cat twice (greet + task) before any acorns appeared. */
     if (g_quest == 0) {
         wchar_t greet[320];
-        swprintf(greet, 320, D_CAT_NEW, g_nick[0] ? g_nick : L"???");
+        SafeWfmt(greet, 320, D_CAT_NEW, g_nick[0] ? g_nick : L"???");
         ShowDialogTop(greet);
         g_catTalked = 1;
         g_quest = 1;
@@ -1468,7 +1524,7 @@ static void TryPickAcorn(HWND hwnd)
         QuestAdvanceCheck();
     } else if (g_quest == 2) {
         wchar_t b[64];
-        swprintf(b, 64, L"\x27E5 \u0416\u0435\u043b\u0443\u0434\u044c: %d/3", g_acorns);
+        SafeWfmt(b, 64, L"\x27E5 \u0416\u0435\u043b\u0443\u0434\u044c: %d/3", g_acorns);
         Toast(b);
     }
     SaveProfile();               /* real-time autosave on loot */
@@ -1555,7 +1611,7 @@ int main(void)
     RespawnAcorns();
     {
         wchar_t greet[320];
-        swprintf(greet, 320, D_CAT_NEW, g_nick);
+        SafeWfmt(greet, 320, D_CAT_NEW, g_nick);
         ShowDialogTop(greet);            /* <-- crashed in v0.10 (formatted buffer) */
     }
     ShowDialogTop(D_CAT_Q1);
@@ -1579,7 +1635,7 @@ int main(void)
     InvAdd(ITEM_BULAVA, 1);
     {
         wchar_t b[256];
-        swprintf(b, 256, D_EQUIPED, Item(ITEM_BULAVA)->name, Item(ITEM_BULAVA)->bonus);
+        SafeWfmt(b, 256, D_EQUIPED, Item(ITEM_BULAVA)->name, Item(ITEM_BULAVA)->bonus);
         ShowDialogTop(b);                /* formatted buffer */
     }
     printf("[ok] smith gave bulava\n");
@@ -1604,7 +1660,7 @@ int main(void)
         g_hpMax += 20; g_hpCur = g_hpMax;
         g_energyMax += 5; g_energyCur = g_energyMax;
         g_quest = 6;
-        swprintf(b, 256, D_PROF_DONE, pnames[0]);
+        SafeWfmt(b, 256, D_PROF_DONE, pnames[0]);
         ShowDialogTop(b);
         Toast(TST_PROF_UP);
         BuildAbilities();
@@ -1685,7 +1741,7 @@ static void TalkCat(HWND hwnd)
     switch (g_quest) {
         case 0: {
             wchar_t greet[320];
-            swprintf(greet, 320, D_CAT_NEW, g_nick[0] ? g_nick : L"???");
+            SafeWfmt(greet, 320, D_CAT_NEW, g_nick[0] ? g_nick : L"???");
             ShowDialogTop(greet);
             g_catTalked = 1;
             g_quest = 1;
@@ -1712,7 +1768,7 @@ static void TalkCat(HWND hwnd)
                 g_quest = 3;
             } else {
                 wchar_t b[128];
-                swprintf(b, 128, D_CAT_PROGRESS, g_acorns);
+                SafeWfmt(b, 128, D_CAT_PROGRESS, g_acorns);
                 ShowDialogTop(b);
             }
             SaveProfile();
@@ -1733,7 +1789,7 @@ static void TalkCat(HWND hwnd)
                 g_quest = 3;
             } else {
                 wchar_t b[128];
-                swprintf(b, 128, D_CAT_PROGRESS, g_acorns);
+                SafeWfmt(b, 128, D_CAT_PROGRESS, g_acorns);
                 ShowDialogTop(b);
             }
             SaveProfile();
@@ -1862,7 +1918,7 @@ static void ChooseProfession(HWND hwnd, int idx)
     g_energyMax += 5; g_energyCur = g_energyMax;
     g_quest = 6;
     pnames[0] = PR_WARRIOR; pnames[1] = PR_HUNTER; pnames[2] = PR_MAGUS;
-    swprintf(b, 256, D_PROF_DONE, pnames[idx]);
+    SafeWfmt(b, 256, D_PROF_DONE, pnames[idx]);
     Toast(TST_PROF_UP);
     BuildAbilities();
     SaveProfile();
@@ -2033,7 +2089,7 @@ static LONG WINAPI TopLevelFilter(EXCEPTION_POINTERS* ep)
     h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
         SetFilePointer(h, 0, NULL, FILE_END);   /* append: keep the whole history */
-        swprintf(line, 256, L"YAV prototype v0.11: exception 0x%08X at 0x%p (fault #%d)\r\n",
+        SafeWfmt(line, 256, L"YAV prototype v0.12: exception 0x%08X at 0x%p (fault #%d)\r\n",
                  ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0,
                  ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : NULL,
                  g_faultCount + 1);

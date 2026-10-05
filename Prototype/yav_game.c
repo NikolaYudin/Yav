@@ -79,7 +79,6 @@ static ClassDef g_class[NCLASS] = {
 static const wchar_t* APP_TITLE = L"\x042f\x0412\x042c: \x0417\x0430\x0431\x044b\x0442\x044b\x0435 \x0411\x044b\x043b\x0438\x043d\x044b";
 static const wchar_t* S_LOGO    = L"\x042f \x0412 \x042c";
 static const wchar_t* S_SLOGAN  = L"\x0417\x0430\x0431\x044b\x0442\x044b\x0435 \x0411\x044b\x043b\x0438\x043d\x044b \x0437\x043e\x0432\x0443\x0442";
-static const wchar_t* S_SUBT    = L"\x041f\x0440\x043e\x0442\x043e\x0442\x0438\x043f v0.2 \x2014 \x0437\x0430\x043f\x0443\x0441\x043a, \x0432\x044b\x0431\x043e\x0440 \x0433\x0435\x0440\x043e\x044f, \x0434\x0435\x0440\x0435\x0432\x043d\x044f";
 static const wchar_t* B_START   = L"\x041d\x0410\x0427\x0410\x0422\x042c \x0418\x0413\x0420\x0423";
 static const wchar_t* B_LORE    = L"\x041f\x0420\x0415\x0414\x0410\x041d\x0418\x0415";
 static const wchar_t* B_EXIT    = L"\x0412\x042b\x0425\x041e\x0414";
@@ -114,6 +113,11 @@ static HFONT g_fBig, g_fMed, g_fSmall, g_fTitle;
 
 /* forward decls */
 static void DrawFrameAt(HDC hdc, RECT r, COLORREF c);
+static void DrawCatExtras(HDC hdc);
+static void DrawVillageCatParts(HDC hdc);
+static void DrawHero(HDC hdc);
+static void PaintLaunch(HWND hwnd, HDC hdc);
+static void PaintSelect(HWND hwnd, HDC hdc);
 static void ShowDialogTop(const wchar_t* fmt, ...);
 static void TalkSmith(HWND hwnd);
 static void TalkMarya(HWND hwnd);
@@ -161,24 +165,28 @@ typedef struct { int x, y, taken; } Acorn;
 static Acorn g_acorns_arr[3] = { {262,196,0}, {352,214,0}, {300,252,0} };
 
 /* ======================= v0.4: items, inventory, NPCs, quests ============ */
-enum { IT_ACORN=1, IT_METAL, IT_CLOTH, IT_POTION, IT_AMULET,
-       IT_BULAVA, IT_LUKO, IT_POSOH, IT_HEAVY, IT_LEATHER, IT_MANTLE };
+enum { ITEM_ACORN=1, ITEM_METAL, ITEM_CLOTH, ITEM_POTION, ITEM_AMULET,
+       ITEM_BULAVA, ITEM_LUKO, ITEM_POSOH, ITEM_HEAVY, ITEM_LEATHER, ITEM_MANTLE };
 enum { CAT_W=0, WARRIOR_W=1, HUNTER_W=2, MAGUS_W=3 };   /* weapon classes */
 typedef struct { int id; const wchar_t* name; COLORREF col; int wcls, bonus; } ItemDef;
-static const ItemDef g_items[] = {
-  { 0, NULL, RGB(0,0,0), 0, 0 },
-  { IT_ACORN,   IT_ACORN,   RGB(0xC8,0x8A,0x3E), 0, 0 },
-  { IT_METAL,   IT_METAL,   RGB(0x8A,0x8A,0x94), 0, 0 },
-  { IT_CLOTH,   IT_CLOTH,   RGB(0xE8,0xE0,0xC8), 0, 0 },
-  { IT_POTION,  IT_POTION,  RGB(0x4A,0xA0,0x60), 0, 0 },
-  { IT_AMULET,  IT_AMULET,  RGB(0xE0,0xB0,0x40), 0, 0 },
-  { IT_BULAVA,  IT_BULAVA,  RGB(0xB0,0x90,0x40), WARRIOR_W, 8 },
-  { IT_LUKO,    IT_LUKO,    RGB(0x7A,0x5A,0x30), HUNTER_W,  8 },
-  { IT_POSOH,   IT_POSOH,   RGB(0x6A,0x4A,0x8A), MAGUS_W,   8 },
-  { IT_HEAVY,   IT_HEAVY,   RGB(0x5A,0x6A,0x8A), 0, 10 },
-  { IT_LEATHER, IT_LEATHER, RGB(0x7A,0x5A,0x3A), 0, 6 },
-  { IT_MANTLE,  IT_MANTLE,  RGB(0x7A,0x4A,0x4A), 0, 4 },
-};
+static ItemDef g_items[12];
+#define NITEMS 12
+static void InitItems(void)
+{
+    int k = 0;
+    g_items[k++] = (ItemDef){ 0, NULL, RGB(0,0,0), 0, 0 };
+    g_items[k++] = (ItemDef){ ITEM_ACORN,  IT_ACORN,  RGB(0xC8,0x8A,0x3E), 0, 0 };
+    g_items[k++] = (ItemDef){ ITEM_METAL,  IT_METAL,  RGB(0x8A,0x8A,0x94), 0, 0 };
+    g_items[k++] = (ItemDef){ ITEM_CLOTH,  IT_CLOTH,  RGB(0xE8,0xE0,0xC8), 0, 0 };
+    g_items[k++] = (ItemDef){ ITEM_POTION, IT_POTION, RGB(0x4A,0xA0,0x60), 0, 0 };
+    g_items[k++] = (ItemDef){ ITEM_AMULET, IT_AMULET, RGB(0xE0,0xB0,0x40), 0, 0 };
+    g_items[k++] = (ItemDef){ ITEM_BULAVA, IT_BULAVA, RGB(0xB0,0x90,0x40), WARRIOR_W, 8 };
+    g_items[k++] = (ItemDef){ ITEM_LUKO,   IT_LUKO,   RGB(0x7A,0x5A,0x30), HUNTER_W,  8 };
+    g_items[k++] = (ItemDef){ ITEM_POSOH,  IT_POSOH,  RGB(0x6A,0x4A,0x8A), MAGUS_W,   8 };
+    g_items[k++] = (ItemDef){ ITEM_HEAVY,  IT_HEAVY,  RGB(0x5A,0x6A,0x8A), 0, 10 };
+    g_items[k++] = (ItemDef){ ITEM_LEATHER,IT_LEATHER,RGB(0x7A,0x5A,0x3A), 0, 6 };
+    g_items[k++] = (ItemDef){ ITEM_MANTLE, IT_MANTLE, RGB(0x7A,0x4A,0x4A), 0, 4 };
+}
 #define NITEMS (int)(sizeof(g_items)/sizeof(g_items[0]))
 static const ItemDef* Item(int id) { int i; for (i=1;i<NITEMS;i++) if (g_items[i].id==id) return &g_items[i]; return NULL; }
 
@@ -204,6 +212,7 @@ static wchar_t g_speaker[64] = L"";   /* who said the current line */
 #define SPOT_X  560
 #define SPOT_Y  360
 
+#define WORLD_TOP 96
 #define OAK_X 300
 #define OAK_Y 190
 #define CAT_X 392
@@ -223,6 +232,7 @@ typedef struct {
     ULONGLONG cd;         /* cooldown ms; <1000 => "basic attack", no cooldown */
     int kind;
     ULONGLONG cdUntil;    /* runtime only */
+    ULONGLONG readyAt;    /* runtime only: when ability is ready again */
     ULONGLONG lastCast;   /* runtime only */
 } Ability;
 static Ability g_ab[NABILITY];
@@ -335,14 +345,14 @@ static int ToggleEquip(HWND hwnd, int id)
         BuildAbilities(); SaveProfile(); InvalidateRect(hwnd, NULL, FALSE);
         return 1;
     }
-    if (id >= IT_HEAVY && id <= IT_MANTLE) {      /* armor slot */
+    if (id >= ITEM_HEAVY && id <= ITEM_MANTLE) {      /* armor slot */
         if (g_equipA) { if (!ToggleEquip(hwnd, g_equipA)) return 0; }
         InvRemove(id, 1); g_equipA = id;
         ShowDialogTop(D_EQUIPED, d->name, d->bonus);
         BuildAbilities(); SaveProfile(); InvalidateRect(hwnd, NULL, FALSE);
         return 1;
     }
-    if (id == IT_AMULET) {
+    if (id == ITEM_AMULET) {
         if (g_equipR) { if (!ToggleEquip(hwnd, g_equipR)) return 0; }
         InvRemove(id, 1); g_equipR = id;
         ShowDialogTop(D_EQUIPED, d->name, 2);
@@ -645,86 +655,16 @@ static void Line(HDC hdc, int x1, int y1, int x2, int y2, COLORREF c, int wide)
 }
 
 /* ------------ Village drawing (logic-free, pure visual layer) ------------- */
-static void DrawVillage(HDC hdc)
+static void DrawVillageCatParts(HDC hdc)
 {
-    int i;
-    /* sky-ish ground palette: meadow */
-    RectFill(hdc, 0, 0, WIN_W, WIN_H, RGB(0x6E,0x8F,0x4E));            /* grass */
-    /* dirt road across the village */
-    RectFill(hdc, 0, 300, WIN_W, 46, RGB(0xA8,0x8A,0x5C));
-    for (i = 0; i < 12; i++)
-        FillCircle(hdc, 20 + i * 55, 322 + ((i * 37) % 14), 2, RGB(0x8A,0x70,0x48));
-
-    /* fence along the top */
-    for (i = 0; i < 16; i++) {
-        int fx = 10 + i * 40;
-        RectFill(hdc, fx, 58, 5, 26, RGB(0x8B,0x6B,0x3F));
-    }
-    RectFill(hdc, 0, 66, WIN_W, 4, RGB(0x9A,0x78,0x48));
-    RectFill(hdc, 0, 78, WIN_W, 3, RGB(0x9A,0x78,0x48));
-
-    /* izbas (huts) left and right */
-    /* hut 1 */
-    RectFill(hdc, 40, 120, 96, 70, RGB(0xB5,0x8A,0x4E));
-    RectFill(hdc, 40, 120, 96, 8,  RGB(0x8B,0x6B,0x3F));
-    /* roof */
-    { POINT pts[3] = {{30,122},{146,122},{88,86}}; HRGN rg = CreatePolygonRgn(pts,3,WINDING); 
-      HBRUSH b = CreateSolidBrush(RGB(0x6B,0x3F,0x2A)); FillRgn(hdc,rg,b); DeleteObject(b); DeleteObject(rg); }
-    RectFill(hdc, 60, 148, 24, 30, RGB(0x5A,0x3A,0x1E));               /* door */
-    RectFill(hdc, 104, 140, 20, 18, RGB(0x9F,0xD6,0xE8));                    /* window */
-    Line(hdc, 114, 140, 114, 158, RGB(0x5A,0x3A,0x1E), 1);
-    Line(hdc, 104, 149, 124, 149, RGB(0x5A,0x3A,0x1E), 1);
-
-    /* hut 2 */
-    RectFill(hdc, 500, 118, 100, 72, RGB(0xC0,0x96,0x58));
-    { POINT pts[3] = {{490,120},{610,120},{550,84}}; HRGN rg = CreatePolygonRgn(pts,3,WINDING);
-      HBRUSH b = CreateSolidBrush(RGB(0x6B,0x3F,0x2A)); FillRgn(hdc,rg,b); DeleteObject(b); DeleteObject(rg); }
-    RectFill(hdc, 520, 150, 24, 32, RGB(0x5A,0x3A,0x1E));
-    RectFill(hdc, 566, 140, 20, 18, RGB(0x9F,0xD6,0xE8));
-    Line(hdc, 576, 140, 576, 158, RGB(0x5A,0x3A,0x1E), 1);
-    Line(hdc, 566, 149, 586, 149, RGB(0x5A,0x3A,0x1E), 1);
-
-    /* well */
-    RectFill(hdc, 150, 250, 40, 26, RGB(0x77,0x77,0x77));
-    Line(hdc, 152, 250, 152, 232, RGB(0x6B,0x3F,0x2A), 3);
-    Line(hdc, 188, 250, 188, 232, RGB(0x6B,0x3F,0x2A), 3);
-    { POINT pts[3] = {{146,234},{194,234},{170,220}}; HRGN rg = CreatePolygonRgn(pts,3,WINDING);
-      HBRUSH b = CreateSolidBrush(RGB(0x8B,0x3A,0x2A)); FillRgn(hdc,rg,b); DeleteObject(b); DeleteObject(rg); }
-
-    /* ---- Oak tree in the center ---- */
-    /* trunk */
-    RectFill(hdc, OAK_X - 10, OAK_Y + 6, 20, 40, RGB(0x6B,0x4A,0x24));
-    Line(hdc, OAK_X - 10, OAK_Y + 20, OAK_X - 26, OAK_Y + 4, RGB(0x6B,0x4A,0x24), 5);
-    Line(hdc, OAK_X + 10, OAK_Y + 26, OAK_X + 28, OAK_Y + 10, RGB(0x6B,0x4A,0x24), 5);
-    /* crown: layered circles */
-    FillCircle(hdc, OAK_X,      OAK_Y - 26, 34, RGB(0x2F,0x5A,0x2B));
-    FillCircle(hdc, OAK_X - 30, OAK_Y - 10, 26, RGB(0x38,0x66,0x30));
-    FillCircle(hdc, OAK_X + 30, OAK_Y - 10, 26, RGB(0x38,0x66,0x30));
-    FillCircle(hdc, OAK_X - 12, OAK_Y - 40, 22, RGB(0x44,0x74,0x38));
-    FillCircle(hdc, OAK_X + 14, OAK_Y - 40, 22, RGB(0x44,0x74,0x38));
-    FillCircle(hdc, OAK_X,      OAK_Y - 14, 30, RGB(0x3E,0x6E,0x34));
-    TextC(hdc, OAK_X, OAK_Y + 50, T_OAK, RGB(0xF0,0xEA,0xD0), g_fSmall, 1);
-
-    /* ---- acorns under the oak ---- */
-    for (i = 0; i < 3; i++) {
-        if (g_acorns_arr[i].taken) continue;
-        /* nut */
-        FillCircle(hdc, g_acorns_arr[i].x, g_acorns_arr[i].y, 6, RGB(0xC8,0x8A,0x3E));
-        /* cap */
-        FillEllipse(hdc, g_acorns_arr[i].x, g_acorns_arr[i].y - 5, 7, 4, RGB(0x6B,0x4A,0x24));
-    }
-
-    /* ---- Cat the Scholar ---- */
     /* body */
     FillEllipse(hdc, CAT_X, CAT_Y + 8, 13, 16, RGB(0x59,0x59,0x63));
     /* head */
     FillCircle(hdc, CAT_X, CAT_Y - 14, 11, RGB(0x66,0x66,0x70));
     /* tail */
     Line(hdc, CAT_X + 12, CAT_Y + 16, CAT_X + 22, CAT_Y - 2, RGB(0x59,0x59,0x63), 4);
+    DrawCatExtras(hdc);
 }
-
-/* NOTE: the block above intentionally avoids complex polygon code; cat ears
- * are drawn in PaintWorld for clarity. */
 
 static void DrawCatExtras(HDC hdc)
 {
@@ -810,30 +750,6 @@ static void DrawDialogBox(HDC hdc)
         if (line2[0]) TextC(hdc, r.left + 12, r.top + 48, line2, RGB(0xF0,0xEA,0xD0), g_fSmall, 0);
     }
     TextC(hdc, r.right - 120, r.bottom - 20, L"[E]/\x041a\x043b\x0438\x043a \x2014 \x0434\x0430\x043b\x044c\x0448\x0435", RGB(0xB0,0xA8,0x88), g_fSmall, 0);
-}
-
-static void DrawQuestTracker(HDC hdc)
-{
-    wchar_t q[128];
-    const wchar_t* st;
-    RECT r = { 24, 12, 616, 44 };
-    HBRUSH b = CreateSolidBrush(RGB(0x1E,0x18,0x10));
-    FillRect(hdc, &r, b); DeleteObject(b);
-    DrawFrame(hdc, r, RGB(0x8A,0x74,0x40));
-
-    switch (g_questStep) {
-        case 0: st = Q_NONE; break;
-        case 1: st = Q_STEP1; break;
-        case 2: swprintf(q, 128, L"%ls (%d/3)", Q_STEP2, g_acorns); st = q; break;
-        case 3: st = Q_STEP3; break;
-        default: st = Q_FIN; break;
-    }
-    TextC(hdc, 34, 18, Q_TITLE, RGB(0xFF,0xE9,0x7A), g_fSmall, 0);
-    { SIZE sz; HFONT of = SelectObject(hdc, g_fSmall); GetTextExtentPoint32W(hdc, Q_TITLE, (int)wcslen(Q_TITLE), &sz); SelectObject(hdc, of);
-      TextC(hdc, 34 + sz.cx + 10, 18, st, RGB(0xF0,0xEA,0xD0), g_fSmall, 0); }
-
-    if (GetTickCount64() < g_saveFlashUntil)
-        TextC(hdc, 560, 18, SAVE_TAG, RGB(0x7A,0xE0,0x7A), g_fSmall, 0);
 }
 
 static void DrawFrameAt(HDC hdc, RECT r, COLORREF c);
@@ -922,7 +838,7 @@ static void PaintInventory(HDC hdc)
             RECT ir = { cx + 8, cy + 8, cx + cell - 12, cy + cell - 12 };
             br = CreateSolidBrush(d->col);
             FillRect(hdc, &ir, br); DeleteObject(br);
-            if (d->wcls || (d->id >= IT_HEAVY && d->id <= IT_MANTLE) || d->id == IT_AMULET)
+            if (d->wcls || (d->id >= ITEM_HEAVY && d->id <= ITEM_MANTLE) || d->id == ITEM_AMULET)
                 DrawFrameAt(hdc, ir, RGB(0xFF,0xE9,0x7A));
             swprintf(b, 48, L"%d", g_inv[i].count);
             TextR(hdc, cx + cell - 8, cy + cell - 20, b, RGB(0xFF,0xFF,0xFF), g_fSmall);
@@ -931,9 +847,6 @@ static void PaintInventory(HDC hdc)
     /* equipped section */
     {
         int ey = y0 + ((INV_CAP + cols - 1)/cols)*cell + 34;
-        static const struct { const wchar_t* lbl; int* slot; } eq[3] =
-            { { SLOT_W, NULL }, { SLOT_A, NULL }, { SLOT_R, NULL } };
-        (void)eq;
         {
             int k;
             const wchar_t* labels[3] = { SLOT_W, SLOT_A, SLOT_R };
@@ -1049,36 +962,16 @@ static void PaintWorld(HDC hdc)
     /* dark grove spot */
     FillEllipse(hdc, SPOT_X, SPOT_Y, 40, 26, RGB(0x14,0x20,0x18));
     TextC(hdc, SPOT_X, SPOT_Y - 4, T_SPOT, RGB(0x7A,0x8A,0x7A), g_fSmall, 1);
-    /* acorns */
+    /* acorns: small nut with cap (matches the IT_ACORN icon color) */
     for (i = 0; i < 3; i++) {
         if (g_acorns_arr[i].taken) continue;
-        br = CreateSolidBrush(RGB(0xC8,0x8A,0x3E));
-        { RECT ar = { g_acorns_arr[i].x - 7, g_acorns_arr[i].y - 7,
-                      g_acorns_arr[i].x + 7, g_acorns_arr[i].y + 7 }; FillRect(hdc, &ar, br); }
-        DeleteObject(br);
+        FillCircle(hdc, g_acorns_arr[i].x, g_acorns_arr[i].y, 6, RGB(0xC8,0x8A,0x3E));
+        FillEllipse(hdc, g_acorns_arr[i].x, g_acorns_arr[i].y - 5, 7, 4, RGB(0x6B,0x4A,0x24));
     }
-    /* cat */
-    { HBRUSH cb = CreateSolidBrush(RGB(0x3A,0x3A,0x4A));
-      RECT cr = { CAT_X - 16, CAT_Y - 10, CAT_X + 16, CAT_Y + 14 };
-      FillRect(hdc, &cr, cb); DeleteObject(cb);
-      pen = CreatePen(PS_SOLID, 2, RGB(0x3A,0x3A,0x4A));
-      { HPEN o = (HPEN)SelectObject(hdc, pen);
-        MoveToEx(hdc, CAT_X - 10, CAT_Y - 10, NULL); LineTo(hdc, CAT_X - 14, CAT_Y - 22);
-        MoveToEx(hdc, CAT_X + 10, CAT_Y - 10, NULL); LineTo(hdc, CAT_X + 14, CAT_Y - 22);
-        SelectObject(hdc, o); }
-      DeleteObject(pen);
-      TextC(hdc, CAT_X, CAT_Y + 18, CAT_NAME, RGB(0xE8,0xC8,0x5A), g_fSmall, 1); }
-    /* player marker */
-    { HBRUSH pb = CreateSolidBrush(RGB(0xE0,0xE0,0xF0));
-      RECT pr = { g_px - 9, g_py - 14, g_px + 9, g_py + 14 };
-      Ellipse(hdc, pr.left, pr.top, pr.right, pr.bottom);
-      DeleteObject(pb);
-      pen = CreatePen(PS_SOLID, 2, RGB(0xC8,0x9A,0x3E));
-      { HPEN o = (HPEN)SelectObject(hdc, pen);
-        SelectObject(hdc, GetStockObject(NULL_BRUSH));
-        Ellipse(hdc, pr.left, pr.top, pr.right, pr.bottom);
-        SelectObject(hdc, o); }
-      DeleteObject(pen); }
+    /* cat body + spectacles + scroll (Kot Ucheny) */
+    DrawVillageCatParts(hdc);
+    /* hero: head, class-colored body, nickname below */
+    DrawHero(hdc);
     /* focus ring around focused entity */
     if (g_focusKind == 1) {
         int fx = g_focusId == 0 ? CAT_X : g_focusId == 1 ? SMITH_X : MARYA_X;
@@ -1097,11 +990,11 @@ static void PaintWorld(HDC hdc)
         else if (g_focusKind == 3) hint = (g_focusId == 0) ? HINT_PICK : HINT_LEAVE;
         else if (g_focusKind == 1) {
             if (g_focusId == 1) {
-                if (g_smithStage == 0) hint = (InvCount(IT_METAL) > 0 && g_quest >= 2) ? HINT_HAND : HINT_FORGE;
+                if (g_smithStage == 0) hint = (InvCount(ITEM_METAL) > 0 && g_quest >= 2) ? HINT_HAND : HINT_FORGE;
                 else if (g_smithStage == 2) hint = HINT_WAIT;
                 else hint = HINT_DONE;
             } else if (g_focusId == 2) {
-                if (g_maryaStage == 0) hint = (InvCount(IT_CLOTH) > 0 && g_quest >= 2) ? HINT_HAND : HINT_WEAVE;
+                if (g_maryaStage == 0) hint = (InvCount(ITEM_CLOTH) > 0 && g_quest >= 2) ? HINT_HAND : HINT_WEAVE;
                 else if (g_maryaStage == 2) hint = HINT_WAIT;
                 else hint = HINT_DONE;
             }
@@ -1244,7 +1137,7 @@ static void TryPickAcorn(HWND hwnd)
     if (best < 0) return;
     g_acorns_arr[best].taken = 1;
     g_acorns++;
-    InvAdd(IT_ACORN, 1);
+    InvAdd(ITEM_ACORN, 1);
     if (g_quest == 2 && g_acorns >= 3) { g_quest = 3; QuestAdvanceCheck(); }
     SaveProfile();               /* real-time autosave on loot */
     InvalidateRect(hwnd, NULL, FALSE);
@@ -1273,13 +1166,13 @@ static void TalkCat(HWND hwnd)
         case 1:
             ShowDialogTop(D_CAT_Q1);
             /* starter kit: metal for smith, cloth for marya, potion */
-            InvAdd(IT_METAL, 1); InvAdd(IT_CLOTH, 1); InvAdd(IT_POTION, 2);
+            InvAdd(ITEM_METAL, 1); InvAdd(ITEM_CLOTH, 1); InvAdd(ITEM_POTION, 2);
             g_quest = 2;
             SaveProfile();
             return;
         case 2:
             if (g_acorns >= 3) {
-                InvAdd(IT_ACORN, 0);
+                InvAdd(ITEM_ACORN, 0);
                 ShowDialogTop(D_CAT_Q2);
                 g_quest = 3;
             } else {
@@ -1322,8 +1215,8 @@ static void TalkSmith(HWND hwnd)
     ULONGLONG now = GetTickCount64();
     if (g_dialogShown) { g_dialogShown = 0; InvalidateRect(hwnd, NULL, FALSE); return; }
     if (g_smithStage == 0) {
-        if (InvCount(IT_METAL) > 0 && g_quest >= 2) {
-            InvRemove(IT_METAL, 1);
+        if (InvCount(ITEM_METAL) > 0 && g_quest >= 2) {
+            InvRemove(ITEM_METAL, 1);
             g_smithStage = 2;                    /* crafting */
             g_smithDoneAt = now + 4000;          /* 4 seconds of forge work */
             ShowDialogTop(D_SMITH_GIVE);
@@ -1337,8 +1230,8 @@ static void TalkSmith(HWND hwnd)
     if (g_smithStage == 2) {
         if (now >= g_smithDoneAt) {
             g_smithStage = 3;
-            InvAdd(IT_BULAVA, 1); InvAdd(IT_LUKO, 1); InvAdd(IT_POSOH, 1);
-            InvAdd(IT_AMULET, 1);
+            InvAdd(ITEM_BULAVA, 1); InvAdd(ITEM_LUKO, 1); InvAdd(ITEM_POSOH, 1);
+            InvAdd(ITEM_AMULET, 1);
             ShowDialogTop(D_SMITH_GOLD);
             if (g_quest == 3 && g_maryaStage >= 3) g_quest = 5;
             SaveProfile();
@@ -1356,8 +1249,8 @@ static void TalkMarya(HWND hwnd)
     ULONGLONG now = GetTickCount64();
     if (g_dialogShown) { g_dialogShown = 0; InvalidateRect(hwnd, NULL, FALSE); return; }
     if (g_maryaStage == 0) {
-        if (InvCount(IT_CLOTH) > 0 && g_quest >= 2) {
-            InvRemove(IT_CLOTH, 1);
+        if (InvCount(ITEM_CLOTH) > 0 && g_quest >= 2) {
+            InvRemove(ITEM_CLOTH, 1);
             g_maryaStage = 2;
             g_maryaDoneAt = now + 4000;
             ShowDialogTop(D_MARYA_GIVE);
@@ -1370,7 +1263,7 @@ static void TalkMarya(HWND hwnd)
     if (g_maryaStage == 2) {
         if (now >= g_maryaDoneAt) {
             g_maryaStage = 3;
-            InvAdd(IT_HEAVY, 1); InvAdd(IT_LEATHER, 1); InvAdd(IT_MANTLE, 1);
+            InvAdd(ITEM_HEAVY, 1); InvAdd(ITEM_LEATHER, 1); InvAdd(ITEM_MANTLE, 1);
             ShowDialogTop(D_MARYA_GOLD);
             if (g_quest == 3 && g_smithStage >= 3) g_quest = 5;
             SaveProfile();
@@ -1386,10 +1279,8 @@ static void TalkMarya(HWND hwnd)
 /* profession choice (after all 3 tasks): 0 Воин, 1 Лучник, 2 Волхв */
 static void ChooseProfession(HWND hwnd, int idx)
 {
-    static const wchar_t* pnames[3] = { PR_WARRIOR, PR_HUNTER, PR_MAGUS };
-    static const wchar_t* pdescs[3] = { PD_WARRIOR, PD_HUNTER, PD_MAGUS };
+    const wchar_t* pnames[3];
     wchar_t b[256];
-    (void)pdescs;
     g_selected = idx;                    /* hotbar follows the profession */
     g_profBonus = 5;
     g_youngster = 0;
@@ -1397,6 +1288,7 @@ static void ChooseProfession(HWND hwnd, int idx)
     g_hpMax += 20; g_hpCur = g_hpMax;    /* level-up heal */
     g_energyMax += 5; g_energyCur = g_energyMax;
     g_quest = 6;
+    pnames[0] = PR_WARRIOR; pnames[1] = PR_HUNTER; pnames[2] = PR_MAGUS;
     swprintf(b, 256, D_PROF_DONE, pnames[idx]);
     BuildAbilities();
     SaveProfile();
@@ -1433,7 +1325,7 @@ static void UpdateFocus(void)
             if (g_acorns_arr[i].taken) continue;
             d = sqrt((double)((g_px-g_acorns_arr[i].x)*(g_px-g_acorns_arr[i].x) +
                               (g_py-g_acorns_arr[i].y)*(g_py-g_acorns_arr[i].y)));
-            if (d < PICK_R && d < bd) { bd = d; kind = 2; id = IT_ACORN; nm = T_ACORN; }
+            if (d < PICK_R && d < bd) { bd = d; kind = 2; id = ITEM_ACORN; nm = T_ACORN; }
         }
     }
     /* dark grove spot */
@@ -1498,7 +1390,8 @@ static void CastAbility(HWND hwnd, int slot)
     }
     g_energyCur -= ab->cost;
     ab->lastCast = now;
-    if (ab->cd > 1000) ab->cdUntil = now + ab->cd;
+    if (ab->cd > 1000) { ab->cdUntil = now + ab->cd; ab->readyAt = ab->cdUntil; }
+    else               { ab->readyAt = now + ab->cd; }
 
     switch (ab->kind) {
         case AB_HEAL:
@@ -1514,7 +1407,7 @@ static void CastAbility(HWND hwnd, int slot)
                 int ddx = g_px - g_acorns_arr[i].x, ddy = g_py - g_acorns_arr[i].y;
                 if (!g_acorns_arr[i].taken && sqrt((double)(ddx*ddx+ddy*ddy)) < PICK_R + 36) {
                     g_acorns_arr[i].taken = 1; g_acorns++;
-                    InvAdd(IT_ACORN, 1);
+                    InvAdd(ITEM_ACORN, 1);
                     if (g_quest == 2 && g_acorns >= 3) { g_quest = 3; QuestAdvanceCheck(); }
                     break;
                 }

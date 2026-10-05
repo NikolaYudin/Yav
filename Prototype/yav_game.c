@@ -1329,6 +1329,11 @@ static void LayoutForScreen(HWND hwnd)
             if (g_nick[0]) SetWindowTextW(g_editNick, g_nick);
             mkbtn(hwnd, B_STARTGAME, IDC_BTN_CHOOSE, (WIN_W - 200) / 2, 348, 200, 36);
             mkbtn(hwnd, B_BACK,   IDC_BTN_BACK,   (WIN_W - 200) / 2, 392, 200, 30);
+            /* BUGFIX v0.9: Enter in the name field = press "НАЧАТЬ ПУТЬ".
+               Previously Enter did nothing here; if the user pressed it on the
+               main menu instead, the default-button path re-opened this screen
+               and some builds faulted right after typing the name. */
+            SendMessageW(g_editNick, EM_SETLIMITTEXT, 24, 0);
             if (g_editNick) SetFocus(g_editNick);   /* v0.8: type the name right away */
             break;
         case SCR_LORE:
@@ -1401,7 +1406,17 @@ static void TryPickAcorn(HWND hwnd)
     g_acorns_arr[best].taken = 1;
     g_acorns++;
     InvAdd(ITEM_ACORN, 1);
-    if (g_quest == 2 && g_acorns >= 3) { g_quest = 3; QuestAdvanceCheck(); }
+    /* BUGFIX v0.9: the acorn task used to jump straight to "report to cat"
+       without any feedback — now every acorn shows a counter and finishing
+       all three fires the completion toast immediately. */
+    if (g_quest == 2 && g_acorns >= 3) {
+        Toast(TST_Q1_DONE);
+        QuestAdvanceCheck();
+    } else if (g_quest == 2) {
+        wchar_t b[64];
+        swprintf(b, 64, L"\x27E5 \u0416\u0435\u043b\u0443\u0434\u044c: %d/3", g_acorns);
+        Toast(b);
+    }
     SaveProfile();               /* real-time autosave on loot */
     InvalidateRect(hwnd, NULL, FALSE);
 }
@@ -1826,6 +1841,11 @@ static void AdvanceTick(HWND hwnd)
    filter, so any stray access violation used to close the window instantly
    (this is what killed the game right after the hero name was entered).
    Now we log the fault next to the exe and let the user choose to continue. */
+/* Fault counter: if the SAME fault keeps firing, "retry" would just re-run
+   the crashing instruction forever (v0.8 bug: pressing Да looped the error).
+   After two retries we stop asking and let the app close gracefully. */
+static int g_faultCount = 0;
+
 static LONG WINAPI TopLevelFilter(EXCEPTION_POINTERS* ep)
 {
     wchar_t path[MAX_PATH], line[256];
@@ -1834,19 +1854,25 @@ static LONG WINAPI TopLevelFilter(EXCEPTION_POINTERS* ep)
     GetModuleFileNameW(NULL, path, MAX_PATH);
     if (wcsrchr(path, L'\\')) wcscpy(wcsrchr(path, L'\\') + 1, L"YavLaunch_error.log");
     else wcscpy(path, L"YavLaunch_error.log");
-    h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
-        swprintf(line, 256, L"YAV prototype v0.8: exception code 0x%08X at address 0x%p\r\n",
+        SetFilePointer(h, 0, NULL, FILE_END);   /* append: keep the whole history */
+        swprintf(line, 256, L"YAV prototype v0.9: exception 0x%08X at 0x%p (fault #%d)\r\n",
                  ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0,
-                 ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : NULL);
+                 ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : NULL,
+                 g_faultCount + 1);
         WriteFile(h, line, (DWORD)(wcslen(line) * sizeof(wchar_t)), &wr, NULL);
         CloseHandle(h);
     }
-    if (MessageBoxW(NULL,
+    g_faultCount++;
+    if (g_faultCount <= 2 && MessageBoxW(NULL,
             L"\x0412 \x043f\x0440\x043e\x0442\x043e\x0442\x0438\x043f\x0435 \x043f\x0440\x043e\x0438\x0437\x043e\x0448\x043b\x0430 "
             L"\x043e\x0448\x0438\x0431\x043a\x0430. \x041f\x043e\x0434\x0440\x043e\x0431\x043d\x043e\x0432\x0430\x0442\x044c "
-            L"\x043f\x0440\x043e\x0434\x043e\x043b\x0436\x0438\x0442\x044c? (\x0441\x043e\x0445\x0440\x0430\x043d\x0438\x0435 "
-            L"\x043d\x0435 \x043f\x043e\x0442\x0435\x0440\x044f\x0435\x0442\x0441\x044f)",
+            L"\x043f\x0440\x043e\x0434\x043e\x043b\x0436\x0438\x0442\x044c?\r\n"
+            L"(\x043f\x043e\x0434\x0440\x043e\x0431\x043d\x043e\x0431\x043d\x044b\x0445: "
+            L"\x0434\x0432\x0430\x0436\x0434\x044b; \x043f\x043e\x0434\x0440\x043e\x0431 "
+            L"\x0441\x043e\x0445\x0440\x0430\x043d\x0438\x044f \x043d\x0435 "
+            L"\x0442\x0435\x0440\x044f\x044e\x0442\x0441\x044f)",
             APP_TITLE, MB_YESNO | MB_ICONERROR | MB_TASKMODAL) == IDYES)
         return EXCEPTION_CONTINUE_EXECUTION;
     return EXCEPTION_EXECUTE_HANDLER;   /* clean exit instead of a hard crash */
@@ -1934,6 +1960,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             OnPaint(hwnd);
             return 0;
         case WM_KEYDOWN:
+            /* BUGFIX v0.9: Enter inside the name field starts the game
+               (sends BN_CLICKED to "НАЧАТЬ ПУТЬ"); on menu screens Enter
+               triggers the primary button instead of doing nothing. */
+            if (wp == VK_RETURN) {
+                if (g_screen == SCR_SELECT && g_editNick && GetFocus() == g_editNick) {
+                    SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(IDC_BTN_CHOOSE, BN_CLICKED),
+                                 (LPARAM)GetDlgItem(hwnd, IDC_BTN_CHOOSE));
+                    return 0;
+                }
+                if (g_screen == SCR_LAUNCH)   { SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(IDC_BTN_START, BN_CLICKED), (LPARAM)GetDlgItem(hwnd, IDC_BTN_START)); return 0; }
+                if (g_screen == SCR_CONTINUE) { SendMessageW(hwnd, WM_COMMAND, MAKEWPARAM(IDC_BTN_CONT,  BN_CLICKED), (LPARAM)GetDlgItem(hwnd, IDC_BTN_CONT));  return 0; }
+            }
             if (g_screen == SCR_PROF) {
                 switch (wp) {
                     case '1': ChooseProfession(hwnd, 0); break;

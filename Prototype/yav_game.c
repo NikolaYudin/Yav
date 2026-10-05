@@ -1329,6 +1329,7 @@ static void LayoutForScreen(HWND hwnd)
             if (g_nick[0]) SetWindowTextW(g_editNick, g_nick);
             mkbtn(hwnd, B_STARTGAME, IDC_BTN_CHOOSE, (WIN_W - 200) / 2, 348, 200, 36);
             mkbtn(hwnd, B_BACK,   IDC_BTN_BACK,   (WIN_W - 200) / 2, 392, 200, 30);
+            if (g_editNick) SetFocus(g_editNick);   /* v0.8: type the name right away */
             break;
         case SCR_LORE:
             mkbtn(hwnd, B_BACK, IDC_BTN_BACK, (WIN_W - 200) / 2, 420, 200, 34);
@@ -1355,6 +1356,14 @@ static void EnterWorld(HWND hwnd)
     InitItems();
     BuildAbilities(); /* class-dependent hotbar */
     RespawnAcorns();  /* v0.6: oak never looks empty after a hand-over */
+    /* v0.8 migration: profiles saved by the buggy v0.7 build could hold a
+       half-started quest (task given but no acorns/resources in the bag).
+       Re-sync the world to the quest state so nothing can deadlock. */
+    if (g_quest >= 1 && g_quest <= 4) {
+        if (g_acorns < 3 && !InvCount(ITEM_ACORN)) { /* fresh task: acorns already respawned above */ }
+        if (g_quest >= 3 && !InvCount(ITEM_METAL)) InvAdd(ITEM_METAL, 1);
+        if (g_quest >= 4 && !InvCount(ITEM_CLOTH)) InvAdd(ITEM_CLOTH, 1);
+    }
     g_screen = SCR_WORLD;
     SetTimer(hwnd, 2, 50, NULL);   /* mouse-walk / regen tick */
     LayoutForScreen(hwnd);
@@ -1813,6 +1822,36 @@ static void AdvanceTick(HWND hwnd)
 }
 
 /* ------------------------------ Window proc ------------------------------- */
+/* v0.8 crash-guard: the prototype runs without a CRT structured-exception
+   filter, so any stray access violation used to close the window instantly
+   (this is what killed the game right after the hero name was entered).
+   Now we log the fault next to the exe and let the user choose to continue. */
+static LONG WINAPI TopLevelFilter(EXCEPTION_POINTERS* ep)
+{
+    wchar_t path[MAX_PATH], line[256];
+    DWORD wr;
+    HANDLE h;
+    GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (wcsrchr(path, L'\\')) wcscpy(wcsrchr(path, L'\\') + 1, L"YavLaunch_error.log");
+    else wcscpy(path, L"YavLaunch_error.log");
+    h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h != INVALID_HANDLE_VALUE) {
+        swprintf(line, 256, L"YAV prototype v0.8: exception code 0x%08X at address 0x%p\r\n",
+                 ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0,
+                 ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : NULL);
+        WriteFile(h, line, (DWORD)(wcslen(line) * sizeof(wchar_t)), &wr, NULL);
+        CloseHandle(h);
+    }
+    if (MessageBoxW(NULL,
+            L"\x0412 \x043f\x0440\x043e\x0442\x043e\x0442\x0438\x043f\x0435 \x043f\x0440\x043e\x0438\x0437\x043e\x0448\x043b\x0430 "
+            L"\x043e\x0448\x0438\x0431\x043a\x0430. \x041f\x043e\x0434\x0440\x043e\x0431\x043d\x043e\x0432\x0430\x0442\x044c "
+            L"\x043f\x0440\x043e\x0434\x043e\x043b\x0436\x0438\x0442\x044c? (\x0441\x043e\x0445\x0440\x0430\x043d\x0438\x0435 "
+            L"\x043d\x0435 \x043f\x043e\x0442\x0435\x0440\x044f\x0435\x0442\x0441\x044f)",
+            APP_TITLE, MB_YESNO | MB_ICONERROR | MB_TASKMODAL) == IDYES)
+        return EXCEPTION_CONTINUE_EXECUTION;
+    return EXCEPTION_EXECUTE_HANDLER;   /* clean exit instead of a hard crash */
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 {
     static int hasProfile = -1;
@@ -2000,7 +2039,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 }
             }
             return 0;
-        case WM_COMMAND:
+        case WM_COMMAND: {
+            int i = 0;   /* v0.8: used by the name-trim logic in IDC_BTN_CHOOSE */
             switch (LOWORD(wp)) {
                 case IDC_BTN_P0: case IDC_BTN_P1: case IDC_BTN_P2:
                     ChooseProfession(hwnd, (int)LOWORD(wp) - IDC_BTN_P0);
@@ -2020,8 +2060,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     break;
                 case IDC_BTN_CHOOSE: {   /* v0.5: "НАЧАТЬ ПУТЬ" — name only, hero starts as молодец */
                     wchar_t nick[64];
+                    if (!g_editNick) break;              /* v0.8 guard */
                     GetWindowTextW(g_editNick, nick, 63);
-                    if (!nick[0]) { MessageBoxW(hwnd, H_WARNNICK, APP_TITLE, MB_OK | MB_ICONWARNING); break; }
+                    nick[63] = 0;                        /* v0.8 guard against unterminated text */
+                    for (i = 0; i < 64 && nick[i]; i++)  /* v0.8: trim leading/trailing spaces */
+                        ;
+                    while (i > 0 && nick[i-1] == L' ') nick[--i] = 0;
+                    if (!nick[0]) { MessageBoxW(hwnd, H_WARNNICK, APP_TITLE, MB_OK | MB_ICONWARNING); SetFocus(g_editNick); break; }
                     lstrcpynW(g_nick, nick, 64);
                     g_selected = -1;                 /* no class until profession is chosen */
                     g_youngster = 1; g_level = 1; g_profBonus = 0;
@@ -2061,6 +2106,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     break; }
             }
             return 0;
+        }
         case WM_CLOSE:
             SaveProfile(); /* persist on exit */
             DestroyWindow(hwnd);
@@ -2089,6 +2135,8 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE ph, LPSTR cl, int cs)
     WNDCLASSW wc = {0};
     HWND hwnd;
     MSG m;
+
+    SetUnhandledExceptionFilter(TopLevelFilter);  /* v0.8: no silent crash-exit */
     RECT rc = {0, 0, WIN_W, WIN_H};
     DWORD style = WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);

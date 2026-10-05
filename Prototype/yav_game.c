@@ -108,6 +108,7 @@ static const wchar_t* SAVE_TAG  = L"\x25CF \x0441\x043e\x0445\x0440\x0430\x043d\
 static int  g_screen   = SCR_LAUNCH;
 static int  g_selected = -1;
 static HWND g_hWnd     = NULL;
+static HINSTANCE g_hInst = NULL;   /* module handle, set in WinMain */
 static HWND g_editNick = NULL;
 static HFONT g_fBig, g_fMed, g_fSmall, g_fTitle;
 
@@ -196,6 +197,9 @@ static int   g_equipW = 0, g_equipA = 0, g_equipR = 0;   /* item ids or 0 */
 static int   g_invOpen = 0;
 static int   g_level = 1, g_profBonus = 0;              /* profession bonus */
 static int   g_youngster = 1;                           /* 1 = молодец, 0 = истый герой */
+/* v0.5: starter stats for the "молодец" (no class chosen at creation) */
+#define YOUNG_HP 100
+#define YOUNG_EN 60
 static int   g_quest = 0;                               /* see quest flow below */
 static int   g_smithStage = 0, g_maryaStage = 0;        /* 0 none,1 got mat,2 crafting,3 done */
 static ULONGLONG g_smithDoneAt = 0, g_maryaDoneAt = 0;
@@ -222,7 +226,7 @@ static wchar_t g_speaker[64] = L"";   /* who said the current line */
 #define NABILITY 4
 
 /* ----------------------------- Abilities ---------------------------------- */
-enum { AB_DMG = 0, AB_HEAL, AB_BUFF, AB_PICK };
+enum { AB_NONE = -1, AB_DMG = 0, AB_HEAL, AB_BUFF, AB_PICK };
 typedef struct {
     const wchar_t* name;
     const wchar_t* tag;   /* short effect line for the bar */
@@ -250,7 +254,12 @@ static void BuildAbilities(void)
     g_ab[3].name = L"\x0417\x043e\x0440\x044e";            /* Зорю */
     g_ab[3].tag  = L"+\x0416\x0435\x043b";                 /* +Жел */
     g_ab[3].kind = AB_PICK; g_ab[3].cost = 10; g_ab[3].power = 0; g_ab[3].cd = 3000;
-    switch (g_selected) {
+    if (g_youngster) {
+        /* Молодец: no class yet — simple starter swing only. */
+        dmg = 8;
+        g_ab[1].name = L"";   g_ab[1].kind = AB_NONE; g_ab[1].cost = 0; g_ab[1].cd = 0;
+        g_ab[2].name = L"";   g_ab[2].kind = AB_NONE; g_ab[2].cost = 0; g_ab[2].cd = 0;
+    } else switch (g_selected) {
         case 0: /* Богатырь / Воин */
             dmg = 16;
             g_ab[1].name = L"\x041c\x0435\x0447\x044c";   /* Меч? use Могучий Удар */
@@ -513,6 +522,7 @@ static int LoadProfile(void) /* returns 1 if a valid profile was loaded */
     long sz;
     char* buf;
     int ok = 0, i;
+    int version;
 
     ProfilePathW(wpath, MAX_PATH);
     WideCharToMultiByte(CP_UTF8, 0, wpath, -1, apath, sizeof(apath), NULL, NULL);
@@ -526,16 +536,24 @@ static int LoadProfile(void) /* returns 1 if a valid profile was loaded */
     buf[sz] = 0;
     fclose(f);
 
-    if (strstr(buf, "\"classId\"")) {
+    version = JsonGetInt(buf, "version", 2);
+    if (strstr(buf, "\"nickname\"")) {
         g_selected   = JsonGetInt(buf, "classId", -1);
-        g_hpMax      = JsonGetInt(buf, "hpMax", g_class[g_selected >= 0 && g_selected < NCLASS ? g_selected : 0].hp);
-        g_hpCur      = JsonGetInt(buf, "hp", g_hpMax);
-        g_energyMax  = (g_selected >= 0 && g_selected < NCLASS) ? g_class[g_selected].energy : 60;
-        g_energyCur  = JsonGetInt(buf, "energy", g_energyMax);
-        if (g_energyCur > g_energyMax) g_energyCur = g_energyMax;
+        g_youngster  = JsonGetInt(buf, "youngster", (version < 4) ? 0 : 1);
         g_level      = JsonGetInt(buf, "level", 1);
         g_profBonus  = JsonGetInt(buf, "profBonus", 0);
-        g_youngster  = JsonGetInt(buf, "youngster", 1);
+        if (g_youngster || g_selected < 0 || g_selected >= NCLASS) {
+            /* v0.5: молодец without a class — starter stats */
+            g_hpMax     = YOUNG_HP;
+            g_energyMax = YOUNG_EN;
+        } else {
+            g_hpMax     = g_class[g_selected].hp;
+            g_energyMax = g_class[g_selected].energy;
+        }
+        g_hpMax      = JsonGetInt(buf, "hpMax", g_hpMax);
+        g_hpCur      = JsonGetInt(buf, "hp", g_hpMax);
+        g_energyCur  = JsonGetInt(buf, "energy", g_energyMax);
+        if (g_energyCur > g_energyMax) g_energyCur = g_energyMax;
         g_px         = JsonGetInt(buf, "x", 320);
         g_py         = JsonGetInt(buf, "y", 380);
         g_questStep  = JsonGetInt(buf, "step", 0);
@@ -567,7 +585,7 @@ static int LoadProfile(void) /* returns 1 if a valid profile was loaded */
             }
           } }
         JsonGetStr(buf, "nickname", g_nick, 64, L"");
-        if (g_selected >= 0 && g_selected < NCLASS && wcslen(g_nick) > 0) ok = 1;
+        if (wcslen(g_nick) > 0) ok = 1;   /* v0.5: nickname is enough now */
     }
     free(buf);
     return ok;
@@ -811,32 +829,21 @@ static void PaintLaunch(HWND hwnd, HDC hdc)
     TextC(hdc, WIN_W/2, 452, S_SUBT, RGB(0x5A,0x66,0x7A), g_fSmall, 1);
 }
 
-/* --- Class select: three cards (buttons IDC_CARD_0..2 overlay this art) --- */
+/* --- v0.5: character creation is name-only. The hero starts as a
+       "молодец" (youngster): no class until the Cat's three tasks are done.
+       This screen replaces the old class-card selection. ------------------- */
 static void PaintSelect(HWND hwnd, HDC hdc)
 {
-    int i;
+    RECT fr = { 70, 96, WIN_W - 70, 330 };
     (void)hwnd;
     RectFill(hdc, 0, 0, WIN_W, WIN_H, RGB(0x10,0x14,0x20));
-    TextC(hdc, WIN_W/2, 10, H_SEL0, RGB(0xE8,0xC8,0x5A), g_fMed, 1);
-    for (i = 0; i < NCLASS; i++) {
-        int x = 12 + i * 208, y = 44, w = 200, h = 256;
-        const wchar_t* s = g_class[i].desc;
-        int ly = y + 128;
-        FillCircle(hdc, x + w/2, y + 44, 26, g_class[i].color);
-        FillCircle(hdc, x + w/2, y + 44, 10, RGB(0xE8,0xC8,0x9A));
-        TextC(hdc, x + w/2, y + 80, g_class[i].name, RGB(0xFF,0xF3,0xC0), g_fMed, 1);
-        TextC(hdc, x + w/2, y + 104, g_class[i].tag, RGB(0x9A,0xAA,0xC0), g_fSmall, 1);
-        while (*s && ly < y + h - 26) {           /* naive wrap ~26 chars */
-            wchar_t line[32]; int n = 0;
-            while (s[n] && n < 26) n++;
-            if (s[n] && s[n] != L' ') { while (n > 0 && s[n-1] != L' ') n--; if (!n) n = 26; }
-            wcsncpy(line, s, n); line[n] = 0;
-            TextC(hdc, x + w/2, ly, line, RGB(0xC8,0xC8,0xD8), g_fSmall, 1);
-            s += n; while (*s == L' ') s++;
-            ly += 17;
-        }
-    }
-    TextL(hdc, 132, 312, L"\x0418\x043c\x044f \x0433\x0435\x0440\x043e\x044f:", RGB(0x9A,0xAA,0xC0), g_fSmall);
+    TextC(hdc, WIN_W/2, 26, NEW_HEAD, RGB(0xE8,0xC8,0x5A), g_fBig, 1);
+    DrawFrameAt(hdc, fr, RGB(0xC8,0x9A,0x3E));
+    TextC(hdc, WIN_W/2, 112, NEW_LINE1, RGB(0xFF,0xFF,0xFF), g_fMed, 1);
+    TextC(hdc, WIN_W/2, 146, NEW_LINE2, RGB(0x9A,0xAA,0xC0), g_fSmall, 1);
+    TextC(hdc, WIN_W/2, 170, NEW_LINE3, RGB(0x9A,0xAA,0xC0), g_fSmall, 1);
+    TextC(hdc, WIN_W/2, 226, NEW_NICKLBL, RGB(0xE8,0xC8,0x5A), g_fMed, 1);
+    TextC(hdc, WIN_W/2, 404, NEW_FOOT, RGB(0x7A,0x86,0x9A), g_fSmall, 1);
 }
 
 /* --- Profession choice screen (after all 3 poruchenija) ------------------- */
@@ -1213,13 +1220,13 @@ static void LayoutForScreen(HWND hwnd)
             mkbtn(hwnd, B_EXIT,  IDC_BTN_QUIT,  220, 414, 200, 34);
             break;
         case SCR_SELECT:
-            for (i = 0; i < NCLASS; i++) mkbtn(hwnd, L"", IDC_CARD_0 + i, 12 + i * 208, 44, 200, 256);
-            g_editNick = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
-                                         130, 310, 300, 24, hwnd, (HMENU)(INT_PTR)IDC_EDT_NICK,
+            /* v0.5: name-only creation (no class cards) */
+            g_editNick = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_CENTER | ES_AUTOHSCROLL,
+                                         170, 252, 300, 30, hwnd, (HMENU)(INT_PTR)IDC_EDT_NICK,
                                          GetModuleHandle(NULL), NULL);
             SendMessageW(g_editNick, WM_SETFONT, (WPARAM)g_fMed, TRUE);
             if (g_nick[0]) SetWindowTextW(g_editNick, g_nick);
-            mkbtn(hwnd, B_CHOOSE, IDC_BTN_CHOOSE, 220, 348, 200, 36);
+            mkbtn(hwnd, B_STARTGAME, IDC_BTN_CHOOSE, 220, 348, 200, 36);
             mkbtn(hwnd, B_BACK,   IDC_BTN_BACK,   220, 392, 200, 30);
             break;
         case SCR_LORE:
@@ -1535,8 +1542,9 @@ static void CastAbility(HWND hwnd, int slot)
     ULONGLONG now = GetTickCount64();
     Ability* ab;
     int r, dmg, i;
-    if (slot < 0 || slot >= NABILITY || g_selected < 0) return;
+    if (slot < 0 || slot >= NABILITY) return;
     ab = &g_ab[slot];
+    if (ab->kind == AB_NONE) return;   /* empty hotbar slot (молодец) */
     if (ab->cd > 1000 && now < ab->cdUntil) return;      /* on cooldown */
     if (g_energyCur < ab->cost) {                        /* not enough energy */
         ShowDialogTop(D_ENERGY);
@@ -1797,23 +1805,21 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     g_screen = (hasProfile == 1) ? SCR_CONTINUE : SCR_LAUNCH;
                     LayoutForScreen(hwnd);
                     break;
-                case IDC_CARD_0: case IDC_CARD_1: case IDC_CARD_2: {
-                    int idx = LOWORD(wp) - IDC_CARD_0;
-                    g_selected = idx;
-                    g_hpMax = g_class[idx].hp; g_hpCur = g_class[idx].hp;
-                    g_energyMax = g_class[idx].energy; g_energyCur = g_class[idx].energy;
-                    BuildAbilities(); /* hotbar preview follows the class */
-                    LayoutForScreen(hwnd); /* repaint selection */
-                    break; }
-                case IDC_BTN_CHOOSE: {
+                case IDC_BTN_CHOOSE: {   /* v0.5: "НАЧАТЬ ПУТЬ" — name only, hero starts as молодец */
                     wchar_t nick[64];
-                    if (g_selected < 0) { MessageBoxW(hwnd, B_NEED, APP_TITLE, MB_OK | MB_ICONWARNING); break; }
                     GetWindowTextW(g_editNick, nick, 63);
-                    if (!nick[0]) { MessageBoxW(hwnd, H_WARN, APP_TITLE, MB_OK | MB_ICONWARNING); break; }
+                    if (!nick[0]) { MessageBoxW(hwnd, H_WARNNICK, APP_TITLE, MB_OK | MB_ICONWARNING); break; }
                     lstrcpynW(g_nick, nick, 64);
-                    g_questStep = 0; g_acorns = 0; g_catTalked = 0;
-                    g_px = 320; g_py = 380;
+                    g_selected = -1;                 /* no class until profession is chosen */
+                    g_youngster = 1; g_level = 1; g_profBonus = 0;
+                    g_hpMax = YOUNG_HP; g_hpCur = YOUNG_HP;
+                    g_energyMax = YOUNG_EN; g_energyCur = YOUNG_EN;
+                    g_questStep = 0; g_acorns = 0; g_catTalked = 0; g_quest = 0;
+                    g_smithStage = 0; g_maryaStage = 0;
+                    g_equipW = 0; g_equipA = 0; g_equipR = 0;
+                    memset(g_inv, 0, sizeof(g_inv));
                     memset(g_acorns_arr, 0, sizeof(g_acorns_arr));
+                    g_px = 320; g_py = 380;
                     hasProfile = 1;
                     SaveProfile(); /* real-time: character creation persists now */
                     EnterWorld(hwnd);
@@ -1821,12 +1827,23 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 case IDC_BTN_CONT:
                     EnterWorld(hwnd);
                     break;
-                case IDC_BTN_NEW:
+                case IDC_BTN_NEW: {
+                    wchar_t wpath[MAX_PATH];
                     hasProfile = 0;
                     g_selected = -1; g_nick[0] = 0;
+                    g_youngster = 1; g_level = 1; g_profBonus = 0;
+                    g_hpMax = YOUNG_HP; g_hpCur = YOUNG_HP;
+                    g_energyMax = YOUNG_EN; g_energyCur = YOUNG_EN;
+                    g_quest = 0; g_questStep = 0; g_acorns = 0; g_catTalked = 0;
+                    g_smithStage = 0; g_maryaStage = 0;
+                    g_equipW = 0; g_equipA = 0; g_equipR = 0;
+                    memset(g_inv, 0, sizeof(g_inv));
+                    memset(g_acorns_arr, 0, sizeof(g_acorns_arr));
+                    ProfilePathW(wpath, MAX_PATH);   /* wipe the old save file */
+                    DeleteFileW(wpath);
                     g_screen = SCR_SELECT;
                     LayoutForScreen(hwnd);
-                    break;
+                    break; }
             }
             return 0;
         case WM_CLOSE:

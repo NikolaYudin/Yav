@@ -119,7 +119,7 @@ static void DrawVillageCatParts(HDC hdc);
 static void DrawHero(HDC hdc);
 static void PaintLaunch(HWND hwnd, HDC hdc);
 static void PaintSelect(HWND hwnd, HDC hdc);
-static void ShowDialogTop(const wchar_t* fmt, ...);
+static void ShowDialogTop(const wchar_t* text);   /* v0.10: plain setter (was variadic — crash source) */
 static void TalkSmith(HWND hwnd);
 static void TalkMarya(HWND hwnd);
 static void ChooseProfession(HWND hwnd, int idx);
@@ -140,7 +140,6 @@ static void BuildAbilities(void);          /* v0.8: needed by EnterWorld */
 static int  InvAdd(int id, int n);         /* v0.8: ditto (starter potion) */
 static int  GroveHasLoot(void);
 static void PaintGroveSpot(HDC hdc);
-static void ShowDialogTop(const wchar_t* fmt, ...);
 static void TalkSmith(HWND hwnd);
 static void TalkMarya(HWND hwnd);
 static void ChooseProfession(HWND hwnd, int idx);
@@ -264,6 +263,10 @@ static void BuildAbilities(void)
     /* Hotbar follows the chosen profession; until then the hero is a
        "молодец" (starter) and uses the base set with lower damage. */
     for (i = 0; i < NABILITY; i++) { memset(&g_ab[i], 0, sizeof(Ability)); }
+    /* BUGFIX v0.10: hotbar painted the ability NAME with %ls against a wchar_t*
+       (pointer value), not the string it points to — reading that bogus address
+       raised 0xC0000005 right after entering the world (first WM_PAINT).
+       Store plain wide strings now; the painter uses %s semantics below. */
     g_ab[0].name = L"\x0423\x0434\x0430\x0440";            /* Удар (basic) */
     g_ab[0].tag  = L"-\x0416";                              /* -Ж */
     g_ab[0].kind = AB_DMG; g_ab[0].cost = 0; g_ab[0].cd = 400;
@@ -337,7 +340,7 @@ static int InvAdd(int id, int n)
         if (g_inv[i].id == id && g_inv[i].count > 0) { g_inv[i].count += n; return 1; }
     for (i = 0; i < INV_CAP; i++)
         if (g_inv[i].id == 0) { g_inv[i].id = id; g_inv[i].count = n; return 1; }
-    ShowDialogTop(D_FULL, L"");
+    ShowDialogTop(D_FULL);   /* v0.10: D_FULL has no placeholders — plain setter */
     return 0;
 }
 static int InvCount(int id)
@@ -359,6 +362,25 @@ static void InvRemove(int id, int n)
 }
 static int IsEquipped(int id) { return id && (g_equipW == id || g_equipA == id || g_equipR == id); }
 
+/* v0.10 BUGFIX (crash 0xC0000005 right after entering the world / first loot):
+   ShowDialogTop became a plain single-argument setter in v0.9, but several
+   call sites still passed format arguments (item name, bonus, potion heal).
+   The template string with "%ls"/"%d" was then copied verbatim into the
+   dialog buffer and rendered as-is — and worse, any future reformatting of
+   those leftovers would dereference garbage. Every such site now pre-formats
+   its line with swprintf() into a local buffer before showing it. */
+static void DialogFmt(const wchar_t* tmpl, const wchar_t* a, int n)
+{
+    wchar_t b[256];
+    if (a && tmpl && (wcsstr(tmpl, L"%ls") || wcsstr(tmpl, L"%s")))
+        swprintf(b, 256, tmpl, a, n);
+    else if (tmpl && wcsstr(tmpl, L"%d"))
+        swprintf(b, 256, tmpl, n);
+    else
+        lstrcpynW(b, tmpl ? tmpl : L"", 256);
+    ShowDialogTop(b);
+}
+
 /* equip toggle by item id; returns 1 if state changed */
 static int ToggleEquip(HWND hwnd, int id)
 {
@@ -369,28 +391,28 @@ static int ToggleEquip(HWND hwnd, int id)
         if (g_equipA == id) g_equipA = 0;
         if (g_equipR == id) g_equipR = 0;
         InvAdd(id, 1);
-        ShowDialogTop(D_UNEQ, d->name);
+        DialogFmt(D_UNEQ, d->name, 0);
         BuildAbilities(); SaveProfile(); InvalidateRect(hwnd, NULL, FALSE);
         return 1;
     }
     if (d->wcls) {                               /* weapon slot */
         if (g_equipW) { if (!ToggleEquip(hwnd, g_equipW)) return 0; }
         InvRemove(id, 1); g_equipW = id;
-        ShowDialogTop(D_EQUIPED, d->name, d->bonus);
+        DialogFmt(D_EQUIPED, d->name, d->bonus);
         BuildAbilities(); SaveProfile(); InvalidateRect(hwnd, NULL, FALSE);
         return 1;
     }
     if (id >= ITEM_HEAVY && id <= ITEM_MANTLE) {      /* armor slot */
         if (g_equipA) { if (!ToggleEquip(hwnd, g_equipA)) return 0; }
         InvRemove(id, 1); g_equipA = id;
-        ShowDialogTop(D_EQUIPED, d->name, d->bonus);
+        DialogFmt(D_EQUIPED, d->name, d->bonus);
         BuildAbilities(); SaveProfile(); InvalidateRect(hwnd, NULL, FALSE);
         return 1;
     }
     if (id == ITEM_AMULET) {
         if (g_equipR) { if (!ToggleEquip(hwnd, g_equipR)) return 0; }
         InvRemove(id, 1); g_equipR = id;
-        ShowDialogTop(D_EQUIPED, d->name, 2);
+        DialogFmt(D_EQUIPED, d->name, 2);
         BuildAbilities(); SaveProfile(); InvalidateRect(hwnd, NULL, FALSE);
         return 1;
     }
@@ -412,7 +434,7 @@ static void InvSlotAction(HWND hwnd, int idx)
         InvRemove(ITEM_POTION, 1);
         g_hpCur += r; if (g_hpCur > g_hpMax) g_hpCur = g_hpMax;
         lstrcpynW(g_speaker, IT_POTION, 64);
-        ShowDialogTop(D_POTION, r);
+        DialogFmt(D_POTION, NULL, r);   /* v0.10: D_POTION has no placeholders */
         SaveProfile();
         InvalidateRect(hwnd, NULL, FALSE);
         return;
@@ -863,13 +885,18 @@ static void DrawFrameAt(HDC hdc, RECT r, COLORREF c);
 /* --------------------- v0.4: dialog + launch/select paint ----------------- */
 /* Variadic dialog writer: shows text in the right-side dialog window and
    remembers the speaker (cat / smith / marya) by format-string identity. */
-static void ShowDialogTop(const wchar_t* fmt, ...)
+/* BUGFIX v0.10 (crash 0xC0000005 right after entering the world):
+   ShowDialogTop used to be variadic and ALWAYS ran the printf-formatter over
+   its first argument. Most call sites passed an already-formatted string with
+   NO extra args — the formatter then treated that string's own characters as
+   pointer arguments and dereferenced them => access violation at a fixed
+   address inside the function (exactly what YavLaunch_error.log showed).
+   It is now a plain single-argument setter; every caller pre-formats its line
+   with swprintf into a local buffer before showing it. */
+static void ShowDialogTop(const wchar_t* text)
 {
-    va_list ap;
-    va_start(ap, fmt);
-    _vsnwprintf(g_dialogText, 511, fmt, ap);
-    g_dialogText[511] = 0;
-    va_end(ap);
+    const wchar_t* fmt = text;   /* speaker detection still keys off the template identity */
+    lstrcpynW(g_dialogText, text ? text : L"", 512);
     if      (fmt == D_SMITH_GIVE || fmt == D_SMITH_WAIT || fmt == D_SMITH_GOLD)
         lstrcpynW(g_speaker, NPC_SMITH, 64);
     else if (fmt == D_MARYA_GIVE || fmt == D_MARYA_WAIT || fmt == D_MARYA_GOLD)
@@ -1857,7 +1884,7 @@ static LONG WINAPI TopLevelFilter(EXCEPTION_POINTERS* ep)
     h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
         SetFilePointer(h, 0, NULL, FILE_END);   /* append: keep the whole history */
-        swprintf(line, 256, L"YAV prototype v0.9: exception 0x%08X at 0x%p (fault #%d)\r\n",
+        swprintf(line, 256, L"YAV prototype v0.10: exception 0x%08X at 0x%p (fault #%d)\r\n",
                  ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0,
                  ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : NULL,
                  g_faultCount + 1);

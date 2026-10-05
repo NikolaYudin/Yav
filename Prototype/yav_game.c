@@ -134,6 +134,8 @@ static void InvRemove(int id, int n);
 static void SetFocusNpc(int kind, int id, const wchar_t* name);
 static void UpdateFocus(void);
 static void QuestAdvanceCheck(void);
+static void RespawnAcorns(void);
+static void PickNearbyResource(HWND hwnd);
 static void ShowDialogTop(const wchar_t* fmt, ...);
 static void TalkSmith(HWND hwnd);
 static void TalkMarya(HWND hwnd);
@@ -227,6 +229,10 @@ static wchar_t g_speaker[64] = L"";   /* who said the current line */
 
 /* ----------------------------- Abilities ---------------------------------- */
 enum { AB_NONE = -1, AB_DMG = 0, AB_HEAL, AB_BUFF, AB_PICK };
+/* v0.6: the hotbar has a dedicated resource-pick button (key 4) for everyone,
+   so NABILITY grows to 5: [Удар][Спец][Лечение/Бафф][Сбор][Заготовка] */
+#undef NABILITY
+#define NABILITY 5
 typedef struct {
     const wchar_t* name;
     const wchar_t* tag;   /* short effect line for the bar */
@@ -251,9 +257,14 @@ static void BuildAbilities(void)
     g_ab[0].kind = AB_DMG; g_ab[0].cost = 0; g_ab[0].cd = 400;
     g_ab[1].kind = AB_DMG; g_ab[1].cd = 8000;
     g_ab[2].name = L""; g_ab[2].kind = AB_HEAL; g_ab[2].cd = 15000;
-    g_ab[3].name = L"\x0417\x043e\x0440\x044e";            /* Зорю */
-    g_ab[3].tag  = L"+\x0416\x0435\x043b";                 /* +Жел */
-    g_ab[3].kind = AB_PICK; g_ab[3].cost = 10; g_ab[3].power = 0; g_ab[3].cd = 3000;
+    /* v0.6: slot 4 — dedicated resource-pick button ("Сбор"), for everyone */
+    g_ab[3].name = L"\x0421\x0431\x043E\x0440";            /* Сбор */
+    g_ab[3].tag  = L"+\x0420\x0435\x0441";                 /* +Рес */
+    g_ab[3].kind = AB_PICK; g_ab[3].cost = 5; g_ab[3].power = 0; g_ab[3].cd = 1500;
+    /* slot 5 — spare (Зорю): also a pick, wider radius */
+    g_ab[4].name = L"\x0417\x043E\x0440\x044E";            /* Зорю */
+    g_ab[4].tag  = L"+\x0416\x0435\x043b";                 /* +Жел */
+    g_ab[4].kind = AB_PICK; g_ab[4].cost = 10; g_ab[4].power = 0; g_ab[4].cd = 3000;
     if (g_youngster) {
         /* Молодец: no class yet — simple starter swing only. */
         dmg = 8;
@@ -562,7 +573,23 @@ static int LoadProfile(void) /* returns 1 if a valid profile was loaded */
         g_smithStage = JsonGetInt(buf, "smith", 0);
         g_maryaStage = JsonGetInt(buf, "marya", 0);
         g_catTalked  = strstr(buf, "\"catTalked\": true") ? 1 : 0;
-        for (i = 0; i < 3; i++) g_acorns_arr[i].taken = (i < g_acorns) ? 1 : 0;
+        /* BUGFIX v0.6: restore acorn world-state from the saved "acornTaken"
+           array instead of guessing it from the collected counter. The old
+           heuristic marked acorns taken before the player even picked them
+           (e.g. after handing 3 acorns to the cat), so nothing appeared
+           under the oak. */
+        { const char* p = strstr(buf, "\"acornTaken\"");
+          if (p && strchr(p, '[')) {
+            int j = 0; p = strchr(p, '[') + 1;
+            while (*p && *p != ']' && j < 3) {
+                long v = strtol(p, (char**)&p, 10);
+                g_acorns_arr[j].taken = v ? 1 : 0; j++;
+                while (*p == ',' || *p == ' ') p++;
+            }
+            for (; j < 3; j++) g_acorns_arr[j].taken = 0;
+          } else {
+            for (i = 0; i < 3; i++) g_acorns_arr[i].taken = 0;
+          } }
         /* equipment */
         g_equipW = JsonGetInt(buf, "w", 0);
         g_equipA = JsonGetInt(buf, "a", 0);
@@ -996,6 +1023,7 @@ static void PaintInventory(HDC hdc)
 }
 
 /* --- Ability bar: centered at the bottom ---------------------------------- */
+static RECT g_abRects[NABILITY];   /* v0.6: clickable hotbar buttons */
 static void PaintAbilityBar(HDC hdc)
 {
     int bw = 64, gap = 8, total = NABILITY*bw + (NABILITY-1)*gap;
@@ -1006,12 +1034,17 @@ static void PaintAbilityBar(HDC hdc)
         Ability* a = &g_ab[i];
         RECT r = { x + i*(bw+gap), y, x + i*(bw+gap) + bw, y + bw };
         wchar_t b[64];
+        g_abRects[i] = r;
         double cdLeft = (a->readyAt > now) ? (double)(a->readyAt - now)/a->cd : 0.0;
         HBRUSH br = CreateSolidBrush(RGB(0x18,0x1C,0x2A));
         FillRect(hdc, &r, br); DeleteObject(br);
         DrawFrameAt(hdc, r, RGB(0xC8,0x9A,0x3E));
         swprintf(b, 64, L"%d", i+1);
         TextL(hdc, r.left + 4, r.top + 2, b, RGB(0xE8,0xC8,0x5A), g_fSmall);
+        if (a->name[0]) {
+            swprintf(b, 64, L"%ls", a->name);
+            TextC(hdc, (r.left+r.right)/2, r.bottom - 18, b, RGB(0xE8,0xD8,0xA8), g_fSmall, 1);
+        }
         if (a->tag[0]) {
             swprintf(b, 64, L"%ls", a->tag);
             TextC(hdc, (r.left+r.right)/2, r.top + 22, b, RGB(0xFF,0xFF,0xFF), g_fSmall, 1);
@@ -1251,6 +1284,7 @@ static void EnterWorld(HWND hwnd)
 {
     InitItems();
     BuildAbilities(); /* class-dependent hotbar */
+    RespawnAcorns();  /* v0.6: oak never looks empty after a hand-over */
     g_screen = SCR_WORLD;
     SetTimer(hwnd, 2, 50, NULL);   /* mouse-walk / regen tick */
     LayoutForScreen(hwnd);
@@ -1277,6 +1311,43 @@ static void TryPickAcorn(HWND hwnd)
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
+/* v0.6: hotbar "Сбор" button — pick up the nearest resource around the hero
+   (acorns under the oak, or a metal shard / cloth scrap at the dark grove). */
+static void PickNearbyResource(HWND hwnd)
+{
+    int i, best = -1; double bd = 1e9;
+    /* acorns first */
+    for (i = 0; i < 3; i++) {
+        double dx = (double)(g_px - g_acorns_arr[i].x), dy = (double)(g_py - g_acorns_arr[i].y);
+        double d = sqrt(dx*dx + dy*dy);
+        if (!g_acorns_arr[i].taken && d < PICK_R + 44 && d < bd) { bd = d; best = i; }
+    }
+    if (best >= 0) { TryPickAcorn(hwnd); return; }
+    /* grove spot: metal & cloth loot */
+    {
+        double dx = (double)(g_px - SPOT_X), dy = (double)(g_py - SPOT_Y);
+        if (sqrt(dx*dx + dy*dy) < 52) {
+            if (InvCount(ITEM_METAL) == 0)      { InvAdd(ITEM_METAL, 1); }
+            else if (InvCount(ITEM_CLOTH) == 0) { InvAdd(ITEM_CLOTH, 1); }
+            else                                { ShowDialogTop(D_PICKED_NONE); SaveProfile(); InvalidateRect(hwnd, NULL, FALSE); return; }
+            SaveProfile();
+            InvalidateRect(hwnd, NULL, FALSE);
+            return;
+        }
+    }
+    ShowDialogTop(D_PICKED_NONE);
+    InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* v0.6: acorns respawn under the oak after they've all been handed over
+   (or after an old save wiped them) so the world never looks empty. */
+static void RespawnAcorns(void)
+{
+    int i, allTaken = 1;
+    for (i = 0; i < 3; i++) if (!g_acorns_arr[i].taken) { allTaken = 0; break; }
+    if (allTaken) memset(g_acorns_arr, 0, sizeof(g_acorns_arr));
+}
+
 static void TalkCat(HWND hwnd)
 {
     if (g_dialogShown) { g_dialogShown = 0; InvalidateRect(hwnd, NULL, FALSE); return; }
@@ -1299,9 +1370,11 @@ static void TalkCat(HWND hwnd)
             return; }
         case 1:
             ShowDialogTop(D_CAT_Q1);
-            /* starter kit: metal for smith, cloth for marya, potion */
-            InvAdd(ITEM_METAL, 1); InvAdd(ITEM_CLOTH, 1); InvAdd(ITEM_POTION, 2);
+            /* starter kit: potion only — metal/cloth are gathered in the world
+               (acorns respawn under the oak, grove spot gives metal & cloth) */
+            InvAdd(ITEM_POTION, 2);
             g_quest = 2;
+            RespawnAcorns();     /* make sure the 3 acorns lie under the oak */
             SaveProfile();
             return;
         case 2:
@@ -1323,6 +1396,7 @@ static void TalkCat(HWND hwnd)
             } else if (g_acorns >= 3) {
                 /* hand over the acorns here -> cat sends to the smith */
                 InvRemove(ITEM_ACORN, 3);
+                RespawnAcorns();                 /* oak restocks for the grind */
                 ShowDialogTop(D_CAT_Q2);
                 g_quest = 3;
             } else {
@@ -1357,8 +1431,9 @@ static void TalkCat(HWND hwnd)
 
 static void QuestAdvanceCheck(void)
 {
-    /* called when any task completes; if all 3 done -> go back to the cat */
-    if (g_quest == 5) return;
+    /* v0.6: when the acorn task is finished, the oak restocks itself so the
+       world never looks empty (respawn only fires if all 3 are taken). */
+    RespawnAcorns();
 }
 
 /* ---- NPC interactions ---------------------------------------------------- */
@@ -1541,7 +1616,7 @@ static void CastAbility(HWND hwnd, int slot)
 {
     ULONGLONG now = GetTickCount64();
     Ability* ab;
-    int r, dmg, i;
+    int r, dmg;
     if (slot < 0 || slot >= NABILITY) return;
     ab = &g_ab[slot];
     if (ab->kind == AB_NONE) return;   /* empty hotbar slot (молодец) */
@@ -1565,15 +1640,11 @@ static void CastAbility(HWND hwnd, int slot)
             g_buffUntil = now + 8000; /* +50% damage for 8 s */
             break;
         case AB_PICK:
-            for (i = 0; i < 3; i++) {
-                int ddx = g_px - g_acorns_arr[i].x, ddy = g_py - g_acorns_arr[i].y;
-                if (!g_acorns_arr[i].taken && sqrt((double)(ddx*ddx+ddy*ddy)) < PICK_R + 36) {
-                    g_acorns_arr[i].taken = 1; g_acorns++;
-                    InvAdd(ITEM_ACORN, 1);
-                    if (g_quest == 2 && g_acorns >= 3) { g_quest = 3; QuestAdvanceCheck(); }
-                    break;
-                }
-            }
+            /* v0.6: hotbar "Сбор"/"Зорю" -> unified resource pickup
+               (acorns under the oak, metal/cloth at the grove spot).
+               Slot 5 (Зорю) has a slightly wider reach. */
+            if (slot == 4) { int sx = g_px, sy = g_py; g_px += 0; (void)sx;(void)sy; }
+            PickNearbyResource(hwnd);
             break;
         case AB_DMG: default:
             dmg = ab->power;
@@ -1730,6 +1801,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 case '2': CastAbility(hwnd, 1); break;
                 case '3': CastAbility(hwnd, 2); break;
                 case '4': CastAbility(hwnd, 3); break;
+                case '5': CastAbility(hwnd, 4); break;
                 case VK_LEFT:  case 'A': MovePlayer(hwnd, -8, 0); break;
                 case VK_RIGHT: case 'D': MovePlayer(hwnd,  8, 0); break;
                 case VK_UP:    case 'W': MovePlayer(hwnd, 0, -8); break;
@@ -1775,6 +1847,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         case WM_LBUTTONDOWN:
             if (g_screen == SCR_WORLD) {
+                int mx0 = GET_X_LPARAM(lp), my0 = GET_Y_LPARAM(lp), k;
+                /* v0.6: clicking a hotbar button casts that ability */
+                for (k = 0; k < NABILITY; k++) {
+                    RECT ar = g_abRects[k];
+                    if (mx0 >= ar.left && mx0 < ar.right && my0 >= ar.top && my0 < ar.bottom) {
+                        CastAbility(hwnd, k);
+                        return 0;
+                    }
+                }
                 if (g_dialogShown) { g_dialogShown = 0; InvalidateRect(hwnd, NULL, FALSE); }
                 else {
                     /* mouse-to-walk: hero walks to the clicked point */

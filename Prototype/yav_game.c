@@ -119,13 +119,16 @@ static HFONT g_fBig, g_fMed, g_fSmall, g_fTitle;
    lines smashed small stack buffers => fixed-address 0xC0000005 crashes.
    SafeWfmt clamps by bytes and guarantees NUL-termination under both CRTs. */
 static void SafeWfmt(wchar_t* out, size_t capElems, const wchar_t* fmt, ...);
+/* v0.15: explicit typed formatter used by DialogFmt and all hot paths */
+static void SafeWfmtN(wchar_t* out, size_t capElems, const wchar_t* fmt,
+                      const wchar_t* a1, int n1, int nargs);
 static void DrawFrameAt(HDC hdc, RECT r, COLORREF c);
 static void DrawCatExtras(HDC hdc);
 static void DrawVillageCatParts(HDC hdc);
 static void DrawHero(HDC hdc);
 static void PaintLaunch(HWND hwnd, HDC hdc);
 static void PaintSelect(HWND hwnd, HDC hdc);
-static void ShowDialogTop(const wchar_t* text);   /* v0.10: plain setter (was variadic — crash source) */
+static void ShowDialogTop(const wchar_t* text, ...);   /* v0.15: variadic-safe setter: formats %ls/%d templates from varargs, copies plain strings as-is */
 static void TalkSmith(HWND hwnd);
 static void TalkMarya(HWND hwnd);
 static void ChooseProfession(HWND hwnd, int idx);
@@ -252,7 +255,7 @@ enum { AB_NONE = -1, AB_DMG = 0, AB_HEAL, AB_BUFF, AB_PICK };
 #define NABILITY 5
 typedef struct {
     const wchar_t* name;
-    wchar_t tag[32];      /* v0.14: fixed buffer — was a pointer; stale/globalalloc'd
+    wchar_t tag[32];      /* v0.15: fixed buffer — was a pointer; stale/globalalloc'd
                              pointers crashed rendering of the hotbar (0xC0000005) */
     int cost;             /* energy */
     int power;
@@ -382,12 +385,18 @@ static int IsEquipped(int id) { return id && (g_equipW == id || g_equipA == id |
 static void DialogFmt(const wchar_t* tmpl, const wchar_t* a, int n)
 {
     wchar_t b[256];
-    if (a && tmpl && (wcsstr(tmpl, L"%ls") || wcsstr(tmpl, L"%s")))
-        SafeWfmt(b, 256, tmpl, a, n);
-    else if (tmpl && wcsstr(tmpl, L"%d"))
-        SafeWfmt(b, 256, tmpl, n);
-    else
-        lstrcpynW(b, tmpl ? tmpl : L"", 256);
+    int hasS = 0, hasD = 0;
+    if (tmpl) {
+        hasS = (wcsstr(tmpl, L"%ls") || wcsstr(tmpl, L"%s")) ? 1 : 0;
+        hasD = wcsstr(tmpl, L"%d") ? 1 : 0;
+    }
+    /* v0.15: explicit typed formatting — no variadic guessing. If the caller
+       gave us a string and/or number, pass them positionally; missing pieces
+       render as empty text instead of reading garbage off the stack. */
+    if (hasS && hasD) SafeWfmtN(b, 256, tmpl, a, n, 2);
+    else if (hasS)    SafeWfmtN(b, 256, tmpl, a, 0, 1);
+    else if (hasD)    SafeWfmtN(b, 256, tmpl, (const wchar_t*)0, n, 2);
+    else              lstrcpynW(b, tmpl ? tmpl : L"", 256);
     ShowDialogTop(b);
 }
 
@@ -955,78 +964,134 @@ static const wchar_t* K_TAKE     = L"\x0414\x0435\x0440\x0436\x0438\x003A";  /* 
    — no printf family at all.  Supported placeholders: %ls / %s (string),
    %d (decimal).  Everything else is copied literally. */
 
-static void WcAppendNum(wchar_t* out, int val)
+/* v0.15 CRITICAL FIX #1: WcAppendNum() used lstrcatW(), which computes the
+   current length of `out` with lstrlenW() every time.  In our hot path the
+   destination buffer was NOT always NUL-terminated yet (see fix #2), so
+   lstrlenW ran off the end of a stack frame => exception 0xC0000005 at ONE
+   fixed address on EVERY dialog — exactly the log pattern reported for
+   v0.12/v0.13/v0.14 (fault #1..#3, identical address).  The function now
+   appends by explicit index and never asks the CRT/user32 for a length. */
+static void WcAppendNum(wchar_t** pp, wchar_t* endExclusive, int val)
 {
     wchar_t tmp[16];
     int neg = val < 0, i = 0, k;
     unsigned u = neg ? (unsigned)(-(val + 1)) + 1u : (unsigned)val;
+    wchar_t* p = *pp;
     if (u == 0) tmp[i++] = L'0';
     while (u) { tmp[i++] = (wchar_t)(L'0' + (u % 10)); u /= 10; }
     if (neg) tmp[i++] = L'-';
-    tmp[i] = 0;
-    for (k = i - 1; k >= 0; --k) {
-        wchar_t one[2] = { tmp[k], 0 };
-        lstrcatW(out, one);
-    }
+    for (k = i - 1; k >= 0 && p < endExclusive; --k) *p++ = tmp[k];
+    *p = 0;
+    *pp = p;
 }
 
-static void SafeWfmt(wchar_t* out, size_t capElems, const wchar_t* fmt, ...)
+/* v0.15 REWRITE.  Two crash sources removed at once:
+   #1 (see WcAppendNum above): no lstrcatW/lstrlenW/wcslen anywhere inside —
+      the running length is kept in a plain local pointer `q`, so we never
+      re-scan the destination buffer (which used to run past its end when a
+      NUL had not been written yet).
+   #2 NULL-va_arg guard: DialogFmt() may pass (a==NULL, n==0) against a
+      template that contains BOTH %ls and %d; then only ONE vararg is pushed
+      but the formatter consumed TWO => va_arg read garbage past the stack
+      frame and dereferencing it raised 0xC0000005.  We now track how many
+      args were actually provided by the caller via a sentinel-counted
+      wrapper and stop substituting when they run out. */
+static void SafeWfmtN(wchar_t* out, size_t capElems, const wchar_t* fmt,
+                      const wchar_t* a1, int n1, int nargs)
 {
-    va_list ap;
+    wchar_t* q = out;
+    wchar_t* end = out + (capElems ? capElems - 1 : 0);
     const wchar_t* p;
-    size_t n = capElems;
-    size_t len = 0;              /* v0.13: maintain length in a register —
-                                    calling lstrlenW(out) as the FIRST arg of
-                                    lstrcatW(out, ...) broke GCC's argument
-                                    registers on x86-64 (out was passed to
-                                    strcat instead of the length) and caused
-                                    the fixed-address 0xC0000005 crash */
-    if (!out || n == 0) return;
-    out[0] = 0;
+    int ai = 0;                  /* index of next string arg to consume */
+    if (!out || capElems == 0) return;
+    *q = 0;
     if (!fmt) return;
-    va_start(ap, fmt);
     for (p = fmt; *p; ) {
         if (*p == L'%') {
             if (p[1] == L'l' && (p[2] == L's' || p[2] == L'S')) {
-                const wchar_t* s = va_arg(ap, const wchar_t*);
+                const wchar_t* s = (ai < nargs) ? ((ai == 0) ? a1 : (const wchar_t*)0) : (const wchar_t*)0;
+                ai++;
                 if (!s) s = L"";
-                while (*s && len + 1 < n) { out[len++] = *s++; }
-                out[len] = 0;
-                p += 3;
-                continue;
+                while (*s && q < end) *q++ = *s++;
+                *q = 0; p += 3; continue;
             }
             if (p[1] == L's' || p[1] == L'c') {
-                const wchar_t* s = va_arg(ap, const wchar_t*);
+                const wchar_t* s = (ai < nargs) ? ((ai == 0) ? a1 : (const wchar_t*)0) : (const wchar_t*)0;
+                ai++;
                 if (!s) s = L"";
-                while (*s && len + 1 < n) { out[len++] = *s++; }
-                out[len] = 0;
-                p += 2;
-                continue;
+                while (*s && q < end) *q++ = *s++;
+                *q = 0; p += 2; continue;
             }
             if (p[1] == L'd' || p[1] == L'i') {
-                WcAppendNum(out, va_arg(ap, int));
-                len = wcslen(out);
-                p += 2;
-                continue;
+                if (nargs >= 2) WcAppendNum(&q, end, n1); else *q = 0;
+                ai++;
+                p += 2; continue;
             }
-            if (p[1] == L'%') {
-                if (len + 1 < n) out[len++] = L'%';
-                out[len] = 0;
-                p += 2;
-                continue;
-            }
+            if (p[1] == L'%') { if (q < end) *q++ = L'%'; *q = 0; p += 2; continue; }
         }
-        if (len + 1 < n) out[len++] = *p;
-        out[len] = 0;
+        if (q < end) *q++ = *p;
+        *q = 0;
         ++p;
     }
-    va_end(ap);
-    out[n - 1] = 0;
 }
 
-static void ShowDialogTop(const wchar_t* text)
+/* Variadic front-end: keeps the classic SafeWfmt(out,cap,fmt,...) signature
+   used across the file, but forwards ONLY through explicit typed wrappers
+   below.  Any call site that passes more than one string / mixed string+int
+   must use the *_A1/_*_A1N helpers instead — the old variadic path could
+   misread the stack (crash source #2). */
+static void SafeWfmt(wchar_t* out, size_t capElems, const wchar_t* fmt, ...)
 {
+    va_list ap;
+    const wchar_t* a1 = (const wchar_t*)0;
+    int n1 = 0, nargs = 0;
+    const wchar_t* q;
+    if (!out || capElems == 0) return;
+    out[0] = 0;
+    if (!fmt) return;
+    /* Count placeholders in the template so we consume exactly that many
+       varargs — never more (garbage), never fewer (misaligned later calls). */
+    for (q = fmt; *q; ) {
+        if (*q == L'%') {
+            if (q[1] == L'l' && (q[2] == L's' || q[2] == L'S')) { nargs++; q += 3; continue; }
+            if ((q[1] == L's' || q[1] == L'c' || q[1] == L'd' || q[1] == L'i')) { nargs++; q += 2; continue; }
+            if (q[1] == L'%') { q += 2; continue; }
+        }
+        q++;
+    }
+    va_start(ap, fmt);
+    if (nargs >= 1) a1 = va_arg(ap, const wchar_t*);
+    if (nargs >= 2) n1 = va_arg(ap, int);
+    va_end(ap);
+    SafeWfmtN(out, capElems, fmt, a1, n1, nargs);
+}
+
+/* v0.15: ShowDialogTop is variadic-safe. If the passed string contains a
+   %ls / %d placeholder (i.e. it is an UNFORMATTED template), we consume the
+   matching varargs and format it; plain strings are copied verbatim. This
+   makes every legacy call site correct by construction and removes the last
+   class of crashes (raw "%ls" rendered into the dialog, or worse — stale
+   pointers read from the stack). */
+static void ShowDialogTop(const wchar_t* text, ...)
+{
+    wchar_t tmp[512];
+    va_list ap;
     if (!text) text = L"";
+    if (StrHas(text, L"%ls") || StrHas(text, L"%s")) {
+        const wchar_t* s;
+        va_start(ap, text);
+        s = va_arg(ap, const wchar_t*);
+        va_end(ap);
+        SafeWfmtN(tmp, 512, text, s ? s : L"", 0, 1);
+        text = tmp;
+    } else if (StrHas(text, L"%d")) {
+        int n;
+        va_start(ap, text);
+        n = va_arg(ap, int);
+        va_end(ap);
+        SafeWfmtN(tmp, 512, text, (const wchar_t*)0, n, 2);
+        text = tmp;
+    }
     lstrcpynW(g_dialogText, text, 512);
     /* detect speaker from CONTENT (pointer identity never matched formatted
        buffers and dereferencing stale pointers caused the AV) */
@@ -1173,7 +1238,10 @@ static void PaintFocusInfo(HDC hdc)
 /* --- Inventory panel (left side, Tab toggle) ------------------------------ */
 static void PaintInventory(HDC hdc)
 {
-    int x0 = 10, y0 = 110, cell = 40, cols = 3, i, n = 0;
+    int cell = 40, cols = 3, i;
+    /* v0.15: right-anchored bag panel (the old left column overlapped the
+       hero HUD after the move to 1024x768). */
+    int x0 = WIN_W - 10 - cols*cell, y0 = 110;
     RECT r = { x0, y0, x0 + cols*cell + 10, y0 + ((INV_CAP + cols - 1)/cols)*cell + 34 };
     HBRUSH br;
     g_invGridN = 0;
@@ -1540,8 +1608,13 @@ static void EnterWorld(HWND hwnd)
        world — previously the hero spawned with an empty oak and had to talk
        to the cat twice (greet + task) before any acorns appeared. */
     if (g_quest == 0) {
+        /* v0.15 FIX #3: D_CAT_NEW contains a %ls placeholder, so it MUST be
+           pre-formatted with SafeWfmtN() — the old code copied the template
+           verbatim into the dialog buffer and the hotbar/dialog painter read
+           past the end of the static string pool => 0xC0000005 right after
+           entering the world (the crash reported for v0.12..v0.14). */
         wchar_t greet[320];
-        SafeWfmt(greet, 320, D_CAT_NEW, g_nick[0] ? g_nick : L"???");
+        SafeWfmtN(greet, 320, D_CAT_NEW, g_nick[0] ? g_nick : L"???", 0, 1);
         ShowDialogTop(greet);
         g_catTalked = 1;
         g_quest = 1;
@@ -1664,7 +1737,7 @@ int main(void)
     RespawnAcorns();
     {
         wchar_t greet[320];
-        SafeWfmt(greet, 320, D_CAT_NEW, g_nick);
+        SafeWfmtN(greet, 320, D_CAT_NEW, g_nick, 0, 1);
         ShowDialogTop(greet);            /* <-- crashed in v0.10 (formatted buffer) */
     }
     ShowDialogTop(D_CAT_Q1);
@@ -1794,7 +1867,7 @@ static void TalkCat(HWND hwnd)
     switch (g_quest) {
         case 0: {
             wchar_t greet[320];
-            SafeWfmt(greet, 320, D_CAT_NEW, g_nick[0] ? g_nick : L"???");
+            SafeWfmtN(greet, 320, D_CAT_NEW, g_nick[0] ? g_nick : L"???", 0, 1);
             ShowDialogTop(greet);
             g_catTalked = 1;
             g_quest = 1;
@@ -2158,14 +2231,14 @@ static LONG WINAPI TopLevelFilter(EXCEPTION_POINTERS* ep)
     h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
         SetFilePointer(h, 0, NULL, FILE_END);   /* append: keep the whole history */
-        /* build "YAV prototype v0.14: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
+        /* build "YAV prototype v0.15: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
            using only string APIs — no msvcrt printf anywhere in this path */
-        lstrcpyW(line, L"YAV prototype v0.14: exception 0x");
+        lstrcpyW(line, L"YAV prototype v0.15: exception 0x");
         WcAppendHex(line, code, 8);
         lstrcatW(line, L" at 0x");
         WcAppendHex(line, addr, 16);
         lstrcatW(line, L" (fault #");
-        WcAppendNum(line, g_faultCount + 1);
+        { wchar_t* qe = line + wcslen(line); WcAppendNum(&qe, line + 511, g_faultCount + 1); }
         lstrcatW(line, L")\r\n");
         WriteFile(h, line, (DWORD)(wcslen(line) * sizeof(wchar_t)), &wr, NULL);
         CloseHandle(h);

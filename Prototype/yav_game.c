@@ -119,7 +119,7 @@ static HFONT g_fBig, g_fMed, g_fSmall, g_fTitle;
    lines smashed small stack buffers => fixed-address 0xC0000005 crashes.
    SafeWfmt clamps by bytes and guarantees NUL-termination under both CRTs. */
 static void SafeWfmt(wchar_t* out, size_t capElems, const wchar_t* fmt, ...);
-/* v0.15: explicit typed formatter used by DialogFmt and all hot paths */
+/* v0.16: explicit typed formatter used by DialogFmt and all hot paths */
 static void SafeWfmtN(wchar_t* out, size_t capElems, const wchar_t* fmt,
                       const wchar_t* a1, int n1, int nargs);
 static void DrawFrameAt(HDC hdc, RECT r, COLORREF c);
@@ -128,7 +128,7 @@ static void DrawVillageCatParts(HDC hdc);
 static void DrawHero(HDC hdc);
 static void PaintLaunch(HWND hwnd, HDC hdc);
 static void PaintSelect(HWND hwnd, HDC hdc);
-static void ShowDialogTop(const wchar_t* text, ...);   /* v0.15: variadic-safe setter: formats %ls/%d templates from varargs, copies plain strings as-is */
+static void ShowDialogTop(const wchar_t* text, ...);   /* v0.16: variadic-safe setter: formats %ls/%d templates from varargs, copies plain strings as-is */
 static void TalkSmith(HWND hwnd);
 static void TalkMarya(HWND hwnd);
 static void ChooseProfession(HWND hwnd, int idx);
@@ -177,6 +177,9 @@ static wchar_t g_toastText[192];
 /* Mouse-to-walk destination (click where to go) */
 static int g_walkDestSet = 0;
 static int g_walkX = 0, g_walkY = 0;
+
+/* v0.16: mouse position for inventory tooltips */
+static int g_mouseX = -1, g_mouseY = -1;
 
 /* Energy / buffs for the ability hotbar (keys 1..4) */
 static int  g_energyCur = 60, g_energyMax = 60;
@@ -255,7 +258,7 @@ enum { AB_NONE = -1, AB_DMG = 0, AB_HEAL, AB_BUFF, AB_PICK };
 #define NABILITY 5
 typedef struct {
     const wchar_t* name;
-    wchar_t tag[32];      /* v0.15: fixed buffer — was a pointer; stale/globalalloc'd
+    wchar_t tag[32];      /* v0.16: fixed buffer — was a pointer; stale/globalalloc'd
                              pointers crashed rendering of the hotbar (0xC0000005) */
     int cost;             /* energy */
     int power;
@@ -390,7 +393,7 @@ static void DialogFmt(const wchar_t* tmpl, const wchar_t* a, int n)
         hasS = (wcsstr(tmpl, L"%ls") || wcsstr(tmpl, L"%s")) ? 1 : 0;
         hasD = wcsstr(tmpl, L"%d") ? 1 : 0;
     }
-    /* v0.15: explicit typed formatting — no variadic guessing. If the caller
+    /* v0.16: explicit typed formatting — no variadic guessing. If the caller
        gave us a string and/or number, pass them positionally; missing pieces
        render as empty text instead of reading garbage off the stack. */
     if (hasS && hasD) SafeWfmtN(b, 256, tmpl, a, n, 2);
@@ -964,7 +967,7 @@ static const wchar_t* K_TAKE     = L"\x0414\x0435\x0440\x0436\x0438\x003A";  /* 
    — no printf family at all.  Supported placeholders: %ls / %s (string),
    %d (decimal).  Everything else is copied literally. */
 
-/* v0.15 CRITICAL FIX #1: WcAppendNum() used lstrcatW(), which computes the
+/* v0.16 CRITICAL FIX #1: WcAppendNum() used lstrcatW(), which computes the
    current length of `out` with lstrlenW() every time.  In our hot path the
    destination buffer was NOT always NUL-terminated yet (see fix #2), so
    lstrlenW ran off the end of a stack frame => exception 0xC0000005 at ONE
@@ -985,7 +988,7 @@ static void WcAppendNum(wchar_t** pp, wchar_t* endExclusive, int val)
     *pp = p;
 }
 
-/* v0.15 REWRITE.  Two crash sources removed at once:
+/* v0.16 REWRITE.  Two crash sources removed at once:
    #1 (see WcAppendNum above): no lstrcatW/lstrlenW/wcslen anywhere inside —
       the running length is kept in a plain local pointer `q`, so we never
       re-scan the destination buffer (which used to run past its end when a
@@ -1066,7 +1069,7 @@ static void SafeWfmt(wchar_t* out, size_t capElems, const wchar_t* fmt, ...)
     SafeWfmtN(out, capElems, fmt, a1, n1, nargs);
 }
 
-/* v0.15: ShowDialogTop is variadic-safe. If the passed string contains a
+/* v0.16: ShowDialogTop is variadic-safe. If the passed string contains a
    %ls / %d placeholder (i.e. it is an UNFORMATTED template), we consume the
    matching varargs and format it; plain strings are copied verbatim. This
    makes every legacy call site correct by construction and removes the last
@@ -1236,10 +1239,133 @@ static void PaintFocusInfo(HDC hdc)
 }
 
 /* --- Inventory panel (left side, Tab toggle) ------------------------------ */
+/* v0.16: simple vector icons for items (drawn inside a slot rect).
+   Replaces the old flat color square so every item is recognizable. */
+static void DrawItemIcon(HDC hdc, RECT ir, int id, COLORREF base)
+{
+    HPEN pen; HBRUSH br; POINT poly[4];
+    int cx = (ir.left + ir.right) / 2, cy = (ir.top + ir.bottom) / 2;
+    int w = ir.right - ir.left, h = ir.bottom - ir.top;
+    switch (id) {
+    case ITEM_ACORN:                       /* acorn: nut + cap + stem */
+        FillEllipse(hdc, cx - w/6, cy - h/10, w/3, h/2 - h/10, base);
+        FillEllipse(hdc, cx - w/5, cy - h/3, w/2.5 > 2 ? (int)(w/2.5) : 3, h/6, RGB(0x6B,0x4A,0x24));
+        pen = CreatePen(PS_SOLID, 2, RGB(0x6B,0x4A,0x24));
+        { HPEN o=(HPEN)SelectObject(hdc,pen); MoveToEx(hdc,cx,cy-h/3,NULL); LineTo(hdc,cx,cy-h/2+1); SelectObject(hdc,o);} DeleteObject(pen);
+        break;
+    case ITEM_METAL:                       /* ore: gray crystal shard */
+        pen = CreatePen(PS_SOLID, 2, RGB(0xD8,0xD8,0xE4));
+        br = CreateSolidBrush(base);
+        { HPEN o=(HPEN)SelectObject(hdc,pen); HBRUSH ob=(HBRUSH)SelectObject(hdc,br);
+          poly[0].x=cx-w/4; poly[0].y=cy+h/4; poly[1].x=cx-w/6; poly[1].y=cy-h/4;
+          poly[2].x=cx+w/5; poly[2].y=cy-h/6; poly[3].x=cx+w/4; poly[3].y=cy+h/4;
+          Polygon(hdc, poly, 4);
+          MoveToEx(hdc,cx-w/6,cy-h/4,NULL); LineTo(hdc,cx+w/12,cy+h/4);
+          SelectObject(hdc,ob); SelectObject(hdc,o);} DeleteObject(pen); DeleteObject(br);
+        break;
+    case ITEM_CLOTH:                       /* fabric roll */
+        br = CreateSolidBrush(base);
+        { RECT rr = { cx-w/3, cy-h/6, cx+w/3, cy+h/6 }; FillRect(hdc,&rr,br); } DeleteObject(br);
+        pen = CreatePen(PS_SOLID, 1, RGB(0xB8,0xA8,0x88));
+        { HPEN o=(HPEN)SelectObject(hdc,pen);
+          MoveToEx(hdc,cx-w/6,cy-h/6,NULL); LineTo(hdc,cx-w/6,cy+h/6);
+          MoveToEx(hdc,cx+w/6,cy-h/6,NULL); LineTo(hdc,cx+w/6,cy+h/6);
+          SelectObject(hdc,o);} DeleteObject(pen);
+        break;
+    case ITEM_POTION:                      /* flask with green brew */
+        pen = CreatePen(PS_SOLID, 2, RGB(0xC8,0xD8,0xE8));
+        br = CreateSolidBrush(RGB(0x2E,0x5A,0x3A));
+        { HPEN o=(HPEN)SelectObject(hdc,pen); HBRUSH ob=(HBRUSH)SelectObject(hdc,br);
+          Ellipse(hdc, cx-w/4, cy-h/8, cx+w/4, cy+h/3);
+          Rectangle(hdc, cx-w/12, cy-h/3, cx+w/12, cy-h/8);
+          SelectObject(hdc,ob); SelectObject(hdc,o);} DeleteObject(pen); DeleteObject(br);
+        FillCircle(hdc, cx, cy+h/8, 3, base);
+        break;
+    case ITEM_AMULET:                      /* gold amulet on a chain */
+        pen = CreatePen(PS_SOLID, 1, RGB(0x9A,0x8A,0x5A));
+        { HPEN o=(HPEN)SelectObject(hdc,pen); Arc(hdc,cx-w/4,cy-h/2,cx+w/4,cy,w/4,-h/4,-w/4,-h/4); SelectObject(hdc,o);} DeleteObject(pen);
+        FillCircle(hdc, cx, cy+h/8, w/6 > 3 ? w/6 : 3, base);
+        FillCircle(hdc, cx, cy+h/8, 2, RGB(0x4A,0x3A,0x10));
+        break;
+    case ITEM_BULAVA: case ITEM_LUKO: case ITEM_POSOH: {
+        COLORREF shaft = id==ITEM_BULAVA ? RGB(0x7A,0x5A,0x30) : id==ITEM_LUKO ? RGB(0x8A,0x6A,0x3A) : RGB(0x6A,0x4A,0x6A);
+        pen = CreatePen(PS_SOLID, 3, shaft);
+        { HPEN o=(HPEN)SelectObject(hdc,pen);
+          if (id == ITEM_LUKO) {
+            Arc(hdc, cx-w/4, cy-h/3, cx+w/6, cy+h/3, cx-w/8, cy+h/3, cx-w/8, cy-h/3);
+            SelectObject(hdc,o);} else {
+            MoveToEx(hdc, cx-w/5, cy+h/3, NULL); LineTo(hdc, cx+w/5, cy-h/3);
+            SelectObject(hdc,o);} DeleteObject(pen);
+          if (id == ITEM_LUKO) { pen=CreatePen(PS_SOLID,1,RGB(0xE0,0xE0,0xE0));
+            { HPEN o2=(HPEN)SelectObject(hdc,pen); MoveToEx(hdc,cx-w/9,cy-h/3+1,NULL); LineTo(hdc,cx-w/9,cy+h/3-1); SelectObject(hdc,o2);} DeleteObject(pen);}
+          if (id == ITEM_BULAVA) FillCircle(hdc, cx+w/5, cy-h/3, w/6>4?w/6:4, base);
+          if (id == ITEM_POSOH) { FillCircle(hdc, cx+w/5, cy-h/3, w/7>3?w/7:3, base);
+                                  FillCircle(hdc, cx+w/5, cy-h/3, 1, RGB(0xFF,0xFF,0xFF)); }
+        }
+        break; }
+    case ITEM_HEAVY: case ITEM_LEATHER: case ITEM_MANTLE: {
+        COLORREF trim = id==ITEM_HEAVY ? RGB(0xD8,0xD8,0xE4) : id==ITEM_LEATHER ? RGB(0x6A,0x4A,0x2A) : RGB(0x9A,0x6A,0xCA);
+        pen = CreatePen(PS_SOLID, 2, trim);
+        br = CreateSolidBrush(base);
+        { HPEN o=(HPEN)SelectObject(hdc,pen); HBRUSH ob=(HBRUSH)SelectObject(hdc,br);
+          poly[0].x=cx-w/4; poly[0].y=cy-h/3; poly[1].x=cx+w/4; poly[1].y=cy-h/3;
+          poly[2].x=cx+w/6; poly[2].y=cy+h/3; poly[3].x=cx-w/6; poly[3].y=cy+h/3;
+          Polygon(hdc, poly, 4);
+          SelectObject(hdc,ob); SelectObject(hdc,o);} DeleteObject(pen); DeleteObject(br);
+        if (id == ITEM_HEAVY) { pen=CreatePen(PS_SOLID,1,trim);
+          { HPEN o=(HPEN)SelectObject(hdc,pen); MoveToEx(hdc,cx-w/5,cy,NULL); LineTo(hdc,cx+w/5,cy);
+            MoveToEx(hdc,cx-w/6,cy+h/6,NULL); LineTo(hdc,cx+w/6,cy+h/6); SelectObject(hdc,o);} DeleteObject(pen);}
+        if (id == ITEM_MANTLE) { pen=CreatePen(PS_SOLID,1,trim);
+          { HPEN o=(HPEN)SelectObject(hdc,pen); MoveToEx(hdc,cx,cy-h/3,NULL); LineTo(hdc,cx,cy+h/3); SelectObject(hdc,o);} DeleteObject(pen);}
+        break; }
+    default:                               /* fallback: colored square */
+        br = CreateSolidBrush(base); FillRect(hdc, &ir, br); DeleteObject(br);
+        break;
+    }
+}
+
+/* v0.16: hover tooltip over an inventory slot — name + hint what it does */
+static void PaintInvTooltip(HDC hdc)
+{
+    int i, idx = -1;
+    const wchar_t* tip = NULL;
+    wchar_t line[96];
+    RECT tr; HBRUSH br; SIZE sz; HPEN pen;
+    if (!g_invOpen || g_mouseX < 0) return;
+    for (i = 0; i < g_invGridN; i++) {
+        RECT r = g_invRects[i];
+        if (g_mouseX >= r.left && g_mouseX < r.right && g_mouseY >= r.top && g_mouseY < r.bottom) { idx = i; break; }
+    }
+    if (idx < 0 || !g_inv[idx].id) return;
+    {
+        const ItemDef* d = Item(g_inv[idx].id);
+        if (d->id == ITEM_ACORN)   tip = L"Жёлудь — гостинец Коту Учёному";
+        else if (d->id == ITEM_METAL) tip = L"Руда — отнести Кузнецу Терентию";
+        else if (d->id == ITEM_CLOTH) tip = L"Полотно — отнести Марье Искуснице";
+        else if (d->id == ITEM_POTION) tip = L"Зелье: двойной клик — выпить (+30 Ж)";
+        else if (d->wcls) SafeWfmt(line, 96, L"%ls — оружие, клик: надеть/снять", d->name), tip = line;
+        else if (d->id >= ITEM_HEAVY && d->id <= ITEM_MANTLE) SafeWfmt(line, 96, L"%ls — одеяние, клик: надеть/снять", d->name), tip = line;
+        else if (d->id == ITEM_AMULET) SafeWfmt(line, 96, L"%ls — оберег, клик: надеть/снять", d->name), tip = line;
+        else tip = d->name;
+    }
+    SelectObject(hdc, g_fSmall);
+    GetTextExtentPoint32W(hdc, tip, (int)wcslen(tip), &sz);
+    tr.left = g_mouseX + 12; tr.top = g_mouseY + 14;
+    tr.right = tr.left + sz.cx + 14; tr.bottom = tr.top + sz.cy + 8;
+    if (tr.right > WIN_W - 6) tr.right = WIN_W - 6, tr.left = tr.right - sz.cx - 14;
+    if (tr.bottom > WIN_H - 6) tr.bottom = WIN_H - 6, tr.top = tr.bottom - sz.cy - 8;
+    br = CreateSolidBrush(RGB(0x0C,0x10,0x1A));
+    FillRect(hdc, &tr, br); DeleteObject(br);
+    pen = CreatePen(PS_SOLID, 1, RGB(0xC8,0x9A,0x3E));
+    { HPEN o=(HPEN)SelectObject(hdc,pen); SelectObject(hdc,GetStockObject(NULL_BRUSH));
+      Rectangle(hdc,tr.left,tr.top,tr.right,tr.bottom); SelectObject(hdc,o);} DeleteObject(pen);
+    TextL(hdc, tr.left + 7, tr.top + 4, tip, RGB(0xFF,0xF3,0xC0), g_fSmall);
+}
+
 static void PaintInventory(HDC hdc)
 {
     int cell = 40, cols = 3, i;
-    /* v0.15: right-anchored bag panel (the old left column overlapped the
+    /* v0.16: right-anchored bag panel (the old left column overlapped the
        hero HUD after the move to 1024x768). */
     int x0 = WIN_W - 10 - cols*cell, y0 = 110;
     RECT r = { x0, y0, x0 + cols*cell + 10, y0 + ((INV_CAP + cols - 1)/cols)*cell + 34 };
@@ -1263,8 +1389,7 @@ static void PaintInventory(HDC hdc)
         if (g_inv[i].id) {
             const ItemDef* d = Item(g_inv[i].id);
             RECT ir = { cx + 8, cy + 8, cx + cell - 12, cy + cell - 12 };
-            br = CreateSolidBrush(d->col);
-            FillRect(hdc, &ir, br); DeleteObject(br);
+            DrawItemIcon(hdc, ir, d->id, d->col);
             if (d->wcls || (d->id >= ITEM_HEAVY && d->id <= ITEM_MANTLE) || d->id == ITEM_AMULET)
                 DrawFrameAt(hdc, ir, RGB(0xFF,0xE9,0x7A));
             SafeWfmt(b, 48, L"%d", g_inv[i].count);
@@ -1421,6 +1546,30 @@ static void PaintWorld(HDC hdc)
     TextC(hdc, OAK_X, OAK_Y + 62, T_OAK, RGB(0xC8,0xC8,0xD8), g_fSmall, 1);
     /* dark grove spot (v0.7: shows remaining loot) */
     PaintGroveSpot(hdc);
+    /* v0.16: movement grid + straight-line trajectory preview (LMB walks
+       only along the axis nearest to the click direction). */
+    if (g_screen == SCR_WORLD) {
+        HPEN gp = CreatePen(PS_DOT, 1, RGB(0x2E,0x4A,0x38));
+        { HPEN o=(HPEN)SelectObject(hdc,gp); SelectObject(hdc,GetStockObject(NULL_BRUSH));
+          for (i = 14; i <= WIN_W - 14; i += 32) { MoveToEx(hdc,i,WORLD_TOP,NULL); LineTo(hdc,i,WIN_H-40); }
+          for (i = WORLD_TOP; i <= WIN_H - 40; i += 32) { MoveToEx(hdc,14,i,NULL); LineTo(hdc,WIN_W-14,i); }
+          SelectObject(hdc,o);} DeleteObject(gp);
+    }
+    if (g_walkDestSet) {
+        int tx = g_walkX, ty = g_walkY;      /* axis-snapped target */
+        double adx = fabs((double)(g_walkX - g_px)), ady = fabs((double)(g_walkY - g_py));
+        HPEN tp; POINT ar[3];
+        if (adx >= ady) ty = g_py; else tx = g_px;
+        tp = CreatePen(PS_DASH, 2, BlockedAt(tx, ty) ? RGB(0xC0,0x50,0x50) : RGB(0xFF,0xE9,0x7A));
+        { HPEN o=(HPEN)SelectObject(hdc,tp);
+          MoveToEx(hdc, g_px, g_py, NULL); LineTo(hdc, tx, ty);
+          SelectObject(hdc,o);} DeleteObject(tp);
+        FillCircle(hdc, tx, ty, 4, BlockedAt(tx,ty) ? RGB(0xC0,0x50,0x50) : RGB(0xFF,0xE9,0x7A));
+        ar[0].x = tx - 6; ar[0].y = ty - 6; ar[1].x = tx + 6; ar[1].y = ty - 6; ar[2].x = tx; ar[2].y = ty + 7;
+        { HBRUSH fb = CreateSolidBrush(BlockedAt(tx,ty) ? RGB(0xC0,0x50,0x50) : RGB(0xFF,0xE9,0x7A));
+          HPEN o=(HPEN)SelectObject(hdc,GetStockObject(NULL_PEN));
+          Polygon(hdc, ar, 3); SelectObject(hdc,o); DeleteObject(fb);}
+    }
     /* acorns: small nut with cap (matches the IT_ACORN icon color) */
     for (i = 0; i < 3; i++) {
         if (g_acorns_arr[i].taken) continue;
@@ -1467,6 +1616,7 @@ static void PaintWorld(HDC hdc)
     PaintInventory(hdc);
     PaintDialogBox(hdc);
     PaintToast(hdc);
+    PaintInvTooltip(hdc);   /* v0.16: item hint on hover (drawn last, above all) */
     /* quest tracker under focus info */
     {
         const wchar_t* qtxt;
@@ -1608,7 +1758,7 @@ static void EnterWorld(HWND hwnd)
        world — previously the hero spawned with an empty oak and had to talk
        to the cat twice (greet + task) before any acorns appeared. */
     if (g_quest == 0) {
-        /* v0.15 FIX #3: D_CAT_NEW contains a %ls placeholder, so it MUST be
+        /* v0.16 FIX #3: D_CAT_NEW contains a %ls placeholder, so it MUST be
            pre-formatted with SafeWfmtN() — the old code copied the template
            verbatim into the dialog buffer and the hotbar/dialog painter read
            past the end of the static string pool => 0xC0000005 right after
@@ -2113,14 +2263,17 @@ static void MovePlayer(HWND hwnd, int dx, int dy)
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
-/* Mouse-driven walking: LMB sets destination, hero walks there each tick */
+/* Mouse-driven walking: LMB sets destination, hero walks there each tick.
+   v0.16: movement is axis-locked — the order snaps to the dominant axis,
+   so the hero always travels along a straight horizontal/vertical line. */
 static void WalkToward(HWND hwnd)
 {
     double dx, dy, d;
     if (!g_walkDestSet) return;
     dx = g_walkX - g_px; dy = g_walkY - g_py;
+    if (fabs(dx) >= fabs(dy)) dy = 0; else dx = 0;   /* snap to one axis */
     d = sqrt(dx * dx + dy * dy);
-    if (d < WALK_SPEED) { g_px = g_walkX; g_py = g_walkY; g_walkDestSet = 0; }
+    if (d < WALK_SPEED) { g_px += (int)dx; g_py += (int)dy; g_walkDestSet = 0; }
     else {
         int nx = g_px + (int)(dx / d * WALK_SPEED);
         int ny = g_py + (int)(dy / d * WALK_SPEED);
@@ -2231,9 +2384,9 @@ static LONG WINAPI TopLevelFilter(EXCEPTION_POINTERS* ep)
     h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
         SetFilePointer(h, 0, NULL, FILE_END);   /* append: keep the whole history */
-        /* build "YAV prototype v0.15: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
+        /* build "YAV prototype v0.16: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
            using only string APIs — no msvcrt printf anywhere in this path */
-        lstrcpyW(line, L"YAV prototype v0.15: exception 0x");
+        lstrcpyW(line, L"YAV prototype v0.16: exception 0x");
         WcAppendHex(line, code, 8);
         lstrcatW(line, L" at 0x");
         WcAppendHex(line, addr, 16);
@@ -2448,13 +2601,28 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         }
                         if (hit >= 0) { TryPickAcorn(hwnd); return 0; }
                     }
-                    if (mx >= 14 && mx <= WIN_W - 14 && my >= 96 && my <= WIN_H - 40 &&
-                        !BlockedAt(mx, my)) {
-                        g_walkX = mx; g_walkY = my; g_walkDestSet = 1;
+                    if (mx >= 14 && mx <= WIN_W - 14 && my >= 96 && my <= WIN_H - 40) {
+                        /* v0.16: straight-line movement — snap the order to
+                           the dominant axis relative to the hero. */
+                        int tx = mx, ty = my;
+                        double adx = fabs((double)(mx - g_px)), ady = fabs((double)(my - g_py));
+                        if (!BlockedAt(tx, ty)) {
+                            if (adx >= ady) { ty = g_py; if (BlockedAt(mx, ty)) { g_walkDestSet = 0; } }
+                            else            { tx = g_px; if (BlockedAt(tx, my)) { g_walkDestSet = 0; } }
+                            if (!BlockedAt(tx, ty)) { g_walkX = tx; g_walkY = ty; g_walkDestSet = 1; }
+                        } else g_walkDestSet = 0;
                         InvalidateRect(hwnd, NULL, FALSE);
                     }
                 }
             }
+            return 0;
+        case WM_MOUSEMOVE:
+            /* v0.16: track cursor for inventory tooltips + live trajectory */
+            { int nx = GET_X_LPARAM(lp), ny = GET_Y_LPARAM(lp);
+              if ((nx != g_mouseX || ny != g_mouseY) && g_screen == SCR_WORLD) {
+                  g_mouseX = nx; g_mouseY = ny;
+                  InvalidateRect(hwnd, NULL, FALSE);
+              } }
             return 0;
         case WM_COMMAND: {
             int i = 0;   /* v0.8: used by the name-trim logic in IDC_BTN_CHOOSE */

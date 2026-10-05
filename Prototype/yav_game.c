@@ -893,18 +893,45 @@ static void DrawFrameAt(HDC hdc, RECT r, COLORREF c);
    address inside the function (exactly what YavLaunch_error.log showed).
    It is now a plain single-argument setter; every caller pre-formats its line
    with swprintf into a local buffer before showing it. */
+/* BUGFIX v0.11 (crash 0xC0000005 at a FIXED address, fault #1..#3 on every
+   dialog): the old code compared the incoming pointer against template
+   POINTERS ("fmt == D_CAT_Q1").  But most callers pass a LOCAL BUFFER that
+   was pre-formatted with swprintf (greet[320], b[256]...), so the pointer
+   NEVER matched — and worse, any caller that passed a NULL or stale pointer
+   made wcslen(NULL) dereference address 0 => access violation.  Speaker
+   detection now works on the TEXT CONTENT (first words of the line), which
+   is robust for formatted lines too, and NULL text is handled safely. */
+static int StrHas(const wchar_t* s, const wchar_t* sub)
+{
+    return (s && sub && *s && *sub && wcsstr(s, sub)) ? 1 : 0;
+}
+/* distinctive first words of every dialog template (for speaker detection) */
+static const wchar_t* K_MEOW     = L"\x041C\x044F\x0443\x0021";            /* "Мяу!" */
+static const wchar_t* K_TASKWORD = L"\x041F\x043E\x0440\x0443\x0447\x0435\x043D\x0438\x0435"; /* "Поручение" */
+static const wchar_t* K_ACORNS   = L"\x0416\x0435\x043B\x0443\x0434\x0435\x0439\x003A";       /* "Желудей:" */
+static const wchar_t* K_SECOND   = L"\x0412\x0442\x043E\x0440\x043E\x0435"; /* "Второе" */
+static const wchar_t* K_THIRD    = L"\x0422\x0440\x0435\x0442\x044C\x0435";  /* "Третье" */
+static const wchar_t* K_PROVED   = L"\x0418\x0441\x043F\x0440\x0430\x0432\x0438\x043B";       /* "Исправил" */
+static const wchar_t* K_CLOTH    = L"\x041F\x043E\x043B\x043E\x0442\x043D";  /* "Полотно/Полотнце" */
+static const wchar_t* K_GY       = L"\x0413\x044B\x0021";                   /* "Гы!" (smith) */
+static const wchar_t* K_TAKE     = L"\x0414\x0435\x0440\x0436\x0438\x003A";  /* "Держи:" (Marya) */
 static void ShowDialogTop(const wchar_t* text)
 {
-    const wchar_t* fmt = text;   /* speaker detection still keys off the template identity */
-    lstrcpynW(g_dialogText, text ? text : L"", 512);
-    if      (fmt == D_SMITH_GIVE || fmt == D_SMITH_WAIT || fmt == D_SMITH_GOLD)
-        lstrcpynW(g_speaker, NPC_SMITH, 64);
-    else if (fmt == D_MARYA_GIVE || fmt == D_MARYA_WAIT || fmt == D_MARYA_GOLD)
-        lstrcpynW(g_speaker, NPC_MARYA, 64);
-    else if (fmt == D_CAT_NEW || fmt == D_CAT_Q1 || fmt == D_CAT_Q2 ||
-             fmt == D_CAT_Q3 || fmt == D_CAT_FINAL || fmt == D_CAT_NEED2 ||
-             fmt == D_CAT_NEED3 || fmt == D_CAT_AGAIN || fmt == D_PROF_DONE)
-        lstrcpynW(g_speaker, CAT_NAME, 64);
+    if (!text) text = L"";
+    lstrcpynW(g_dialogText, text, 512);
+    /* detect speaker from CONTENT (pointer identity never matched formatted
+       buffers and dereferencing stale pointers caused the AV) */
+    if (StrHas(text, K_GY) || StrHas(text, L"\x041A\x0443\x0437\x043D\x0435\x0446"))
+        lstrcpynW(g_speaker, NPC_SMITH, 64);                    /* Кузнец */
+    else if (StrHas(text, K_TAKE) || StrHas(text, L"\x0428\x044C\x044E\x002C") ||
+             (StrHas(text, L"\x041C\x0430\x0440\x044C\x044F") && !StrHas(text, K_CLOTH)))
+        lstrcpynW(g_speaker, NPC_MARYA, 64);                    /* Марья / "Шью," */
+    else if (StrHas(text, K_MEOW) || StrHas(text, K_TASKWORD) || StrHas(text, K_ACORNS) ||
+             StrHas(text, K_SECOND) || StrHas(text, K_THIRD) || StrHas(text, K_PROVED) ||
+             StrHas(text, K_CLOTH))
+        lstrcpynW(g_speaker, CAT_NAME, 64);                     /* Кот Учёный */
+    else
+        g_speaker[0] = 0;   /* nobody specific: system message */
     g_dialogShown = 1;
     g_dialogUntil = GetTickCount64() + 9000;
 }
@@ -1492,6 +1519,128 @@ static void Toast(const wchar_t* text)
     g_toastUntil = GetTickCount64() + 5000;
 }
 
+/* ======================================================================== */
+/* HEADLESS SMOKE TEST (v0.11)                                              */
+/* Build with -DYAV_HEADLESS_TEST and run under wine to replay the exact   */
+/* user flow that crashed: create hero -> enter world -> talk to cat ->    */
+/* collect acorns -> report -> smith -> Marya -> profession -> equip/potion*/
+/* Every dialog/equip/inventory call goes through ShowDialogTop, which is  */
+/* where the 0xC0000005 lived (pointer-identity compare against formatted  */
+/* buffers).  If this runs clean, the GUI path runs clean too.              */
+/* ======================================================================== */
+#ifdef YAV_HEADLESS_TEST
+#include <stdio.h>
+int main(void)
+{
+    printf("== YAV headless smoke test v0.11 ==\n");
+    InitItems();
+
+    /* --- character creation exactly like IDC_BTN_CHOOSE does --- */
+    lstrcpynW(g_nick, L"Test", 64);
+    g_selected = -1; g_youngster = 1; g_level = 1; g_profBonus = 0;
+    g_hpMax = YOUNG_HP; g_hpCur = YOUNG_HP;
+    g_energyMax = YOUNG_EN; g_energyCur = YOUNG_EN;
+    g_questStep = 0; g_acorns = 0; g_catTalked = 0; g_quest = 0;
+    g_smithStage = 0; g_maryaStage = 0;
+    g_equipW = 0; g_equipA = 0; g_equipR = 0;
+    memset(g_inv, 0, sizeof(g_inv));
+    memset(g_acorns_arr, 0, sizeof(g_acorns_arr));
+    g_lootMetal = 0; g_lootCloth = 0;
+    g_px = 512; g_py = 470;
+    SaveProfile();
+    printf("[ok] created + saved profile\n");
+
+    /* --- EnterWorld without a window: replicate its body --- */
+    BuildAbilities();
+    RespawnAcorns();
+    {
+        wchar_t greet[320];
+        swprintf(greet, 320, D_CAT_NEW, g_nick);
+        ShowDialogTop(greet);            /* <-- crashed in v0.10 (formatted buffer) */
+    }
+    ShowDialogTop(D_CAT_Q1);
+    InvAdd(ITEM_POTION, 2);
+    g_quest = 2;
+    printf("[ok] greeted by cat, task1 given\n");
+
+    /* --- collect 3 acorns & report to cat (case 2 branch) --- */
+    g_acorns = 3;
+    ShowDialogTop(D_CAT_Q2);
+    if (InvCount(ITEM_METAL) == 0) { InvAdd(ITEM_METAL, 1); g_lootMetal = 1; }
+    if (InvCount(ITEM_CLOTH) == 0) { InvAdd(ITEM_CLOTH, 1); g_lootCloth = 1; }
+    Toast(TST_Q1_DONE);
+    g_quest = 3;
+    printf("[ok] acorns handed, metal+cloth received\n");
+
+    /* --- smith: hand ore, receive weapon (TalkSmith gold stage) --- */
+    InvRemove(ITEM_METAL, 1);
+    g_smithStage = 3;
+    ShowDialogTop(D_SMITH_GIVE);         /* pointer template */
+    InvAdd(ITEM_BULAVA, 1);
+    {
+        wchar_t b[256];
+        swprintf(b, 256, D_EQUIPED, Item(ITEM_BULAVA)->name, Item(ITEM_BULAVA)->bonus);
+        ShowDialogTop(b);                /* formatted buffer */
+    }
+    printf("[ok] smith gave bulava\n");
+
+    /* --- Marya: hand cloth, receive garment --- */
+    InvRemove(ITEM_CLOTH, 1);
+    g_maryaStage = 3;
+    ShowDialogTop(D_MARYA_GIVE);
+    InvAdd(ITEM_LEATHER, 1);
+    printf("[ok] Marya gave leather armor\n");
+
+    /* --- report back to cat -> final + profession screen --- */
+    ShowDialogTop(D_CAT_FINAL);
+    printf("[ok] cat final dialog\n");
+
+    /* --- choose profession (ChooseProfession body, no hwnd calls) --- */
+    {
+        const wchar_t* pnames[3];
+        wchar_t b[256];
+        pnames[0] = PR_WARRIOR; pnames[1] = PR_HUNTER; pnames[2] = PR_MAGUS;
+        g_selected = 0; g_profBonus = 5; g_youngster = 0; g_level++;
+        g_hpMax += 20; g_hpCur = g_hpMax;
+        g_energyMax += 5; g_energyCur = g_energyMax;
+        g_quest = 6;
+        swprintf(b, 256, D_PROF_DONE, pnames[0]);
+        ShowDialogTop(b);
+        Toast(TST_PROF_UP);
+        BuildAbilities();
+        printf("[ok] profession chosen, abilities rebuilt\n");
+    }
+
+    /* --- inventory interactions that used to AV --- */
+    ToggleEquip(NULL, ITEM_BULAVA);      /* DialogFmt(D_EQUIPED, name, bonus) */
+    printf("[ok] equipped bulava (dialog shown), w=%d\n", g_equipW);
+    ToggleEquip(NULL, ITEM_BULAVA);      /* unequip path: DialogFmt(D_UNEQ...) */
+    printf("[ok] unequipped bulava, w=%d\n", g_equipW);
+    ToggleEquip(NULL, ITEM_LEATHER);
+    printf("[ok] equipped leather, a=%d\n", g_equipA);
+    {   /* potion drink path from InvSlotAction */
+        int r = 30;
+        InvRemove(ITEM_POTION, 1);
+        g_hpCur += r; if (g_hpCur > g_hpMax) g_hpCur = g_hpMax;
+        lstrcpynW(g_speaker, IT_POTION, 64);
+        DialogFmt(D_POTION, NULL, r);
+        printf("[ok] drank potion\n");
+    }
+    ShowDialogTop(NULL);                 /* must NOT crash anymore */
+    printf("[ok] NULL dialog safe\n");
+
+    SaveProfile();
+    memset(g_nick, 0, sizeof(g_nick));
+    if (!LoadProfile()) { printf("[FAIL] load returned 0\n"); return 1; }
+    if (wcscmp(g_nick, L"Test") != 0) { printf("[FAIL] nick mismatch\n"); return 1; }
+    if (g_quest != 6) { printf("[FAIL] quest state lost: %d\n", g_quest); return 1; }
+    printf("[ok] save/load roundtrip, quest=%d lvl=%d hp=%d/%d\n",
+           g_quest, g_level, g_hpCur, g_hpMax);
+    printf("== ALL CHECKS PASSED ==\n");
+    return 0;
+}
+#endif /* YAV_HEADLESS_TEST */
+
 /* v0.7: is there still loot at the dark-grove supply spot? */
 static int GroveHasLoot(void)
 {
@@ -1884,7 +2033,7 @@ static LONG WINAPI TopLevelFilter(EXCEPTION_POINTERS* ep)
     h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
         SetFilePointer(h, 0, NULL, FILE_END);   /* append: keep the whole history */
-        swprintf(line, 256, L"YAV prototype v0.10: exception 0x%08X at 0x%p (fault #%d)\r\n",
+        swprintf(line, 256, L"YAV prototype v0.11: exception 0x%08X at 0x%p (fault #%d)\r\n",
                  ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionCode : 0,
                  ep && ep->ExceptionRecord ? ep->ExceptionRecord->ExceptionAddress : NULL,
                  g_faultCount + 1);

@@ -123,7 +123,6 @@ static void ShowDialogTop(const wchar_t* fmt, ...);
 static void TalkSmith(HWND hwnd);
 static void TalkMarya(HWND hwnd);
 static void ChooseProfession(HWND hwnd, int idx);
-static void DrawAbilityBar(HDC hdc);
 static int  BlockedAt(int nx, int ny);
 static void CastAbility(HWND hwnd, int slot);
 static void SaveProfile(void);
@@ -137,6 +136,8 @@ static void QuestAdvanceCheck(void);
 static void RespawnAcorns(void);
 static void PickNearbyResource(HWND hwnd);
 static void Toast(const wchar_t* text);
+static void BuildAbilities(void);          /* v0.8: needed by EnterWorld */
+static int  InvAdd(int id, int n);         /* v0.8: ditto (starter potion) */
 static int  GroveHasLoot(void);
 static void PaintGroveSpot(HDC hdc);
 static void ShowDialogTop(const wchar_t* fmt, ...);
@@ -318,9 +319,13 @@ static void BuildAbilities(void)
     if (g_equipA) dmg += Item(g_equipA)->bonus / 2;
     g_ab[0].power = dmg;
     {
-        static wchar_t t0[8];
-        swprintf(t0, 8, L"-%d", dmg);
-        g_ab[0].tag = t0;
+        /* BUGFIX v0.8: the tag buffer used to be a static array living in a
+           READ-ONLY data segment (strings_gen.h) — writing into it crashed the
+           process the moment an ability was cast after character creation
+           ("game closed right after entering the name"). Now the basic-hit
+           label is generated at runtime from the global string pool. */
+        wchar_t* buf = (wchar_t*)GlobalAlloc(GPTR, 16 * sizeof(wchar_t));
+        if (buf) { swprintf(buf, 16, L"-%d", dmg); g_ab[0].tag = buf; }
     }
 }
 
@@ -433,8 +438,6 @@ static void ProfilePathW(wchar_t* out, size_t cch)
 static void SaveProfile(void)
 {
     wchar_t wpath[MAX_PATH], wtmp[MAX_PATH];
-    if (g_editNick && g_screen == SCR_SELECT)
-        GetWindowTextW(g_editNick, g_nick, 63); /* keep live nickname */
     char apath[MAX_PATH*3], atmp[MAX_PATH*3], nutf[256];
     FILE* f;
     time_t t = time(NULL);
@@ -588,6 +591,14 @@ static int LoadProfile(void) /* returns 1 if a valid profile was loaded */
             if (ox <= 320 && g_px > 172 && g_px < 348 && g_py > 116 && g_py < 204)
                 g_px = 420;   /* pushed out of the smith hut footprint */
         }
+        /* BUGFIX v0.8: clamp EVERY loaded position (incl. fresh 1024x768 saves)
+           into the walkable field — a hero saved inside a hut used to get
+           stuck on load and break the mouse-to-walk flow. */
+        if (g_px < 20)      g_px = 20;
+        if (g_px > WIN_W-20) g_px = WIN_W - 20;
+        if (g_py < WORLD_TOP + 24) g_py = WORLD_TOP + 24;
+        if (g_py > WIN_H - 90)     g_py = WIN_H - 90;
+        if (BlockedAt(g_px, g_py)) { g_px = 512; g_py = 470; } /* spawn fallback */
         g_questStep  = JsonGetInt(buf, "step", 0);
         g_quest      = JsonGetInt(buf, "q", 0);
         g_acorns     = JsonGetInt(buf, "acorns", 0);
@@ -915,7 +926,7 @@ static void PaintProfession(HWND hwnd, HDC hdc)
     RectFill(hdc, 0, 0, WIN_W, WIN_H, RGB(0x08,0x0A,0x12));
     TextC(hdc, WIN_W/2, 14, PROF_TITLE, RGB(0xE8,0xC8,0x5A), g_fMed, 1);
     for (i = 0; i < 3; i++) {
-        int x = 12 + i * 208, y = 52, w = 200, h = 300;
+        int x = (WIN_W - 624) / 2 + i * 208, y = 52, w = 200, h = 300;
         RECT cr = { x, y, x + w, y + h };
         HBRUSH b = CreateSolidBrush(RGB(0x1A,0x1E,0x2C));
         const wchar_t* s = descs[i];
@@ -1304,32 +1315,35 @@ static void LayoutForScreen(HWND hwnd)
 
     switch (g_screen) {
         case SCR_LAUNCH:
-            mkbtn(hwnd, B_START, IDC_BTN_START, 220, 320, 200, 40);
-            mkbtn(hwnd, B_LORE,  IDC_BTN_LORE,  220, 370, 200, 34);
-            mkbtn(hwnd, B_EXIT,  IDC_BTN_QUIT,  220, 414, 200, 34);
+            /* v0.8: menu buttons centered for 1024x768 (were left-aligned on the old 640 canvas) */
+            mkbtn(hwnd, B_START, IDC_BTN_START, (WIN_W - 200) / 2, 320, 200, 40);
+            mkbtn(hwnd, B_LORE,  IDC_BTN_LORE,  (WIN_W - 200) / 2, 370, 200, 34);
+            mkbtn(hwnd, B_EXIT,  IDC_BTN_QUIT,  (WIN_W - 200) / 2, 414, 200, 34);
             break;
         case SCR_SELECT:
-            /* v0.5: name-only creation (no class cards) */
+            /* v0.5: name-only creation (no class cards) — v0.8: centered for 1024x768 */
             g_editNick = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_CENTER | ES_AUTOHSCROLL,
-                                         170, 252, 300, 30, hwnd, (HMENU)(INT_PTR)IDC_EDT_NICK,
+                                         (WIN_W - 300) / 2, 252, 300, 30, hwnd, (HMENU)(INT_PTR)IDC_EDT_NICK,
                                          GetModuleHandle(NULL), NULL);
             SendMessageW(g_editNick, WM_SETFONT, (WPARAM)g_fMed, TRUE);
             if (g_nick[0]) SetWindowTextW(g_editNick, g_nick);
-            mkbtn(hwnd, B_STARTGAME, IDC_BTN_CHOOSE, 220, 348, 200, 36);
-            mkbtn(hwnd, B_BACK,   IDC_BTN_BACK,   220, 392, 200, 30);
+            mkbtn(hwnd, B_STARTGAME, IDC_BTN_CHOOSE, (WIN_W - 200) / 2, 348, 200, 36);
+            mkbtn(hwnd, B_BACK,   IDC_BTN_BACK,   (WIN_W - 200) / 2, 392, 200, 30);
             break;
         case SCR_LORE:
-            mkbtn(hwnd, B_BACK, IDC_BTN_BACK, 220, 420, 200, 34);
+            mkbtn(hwnd, B_BACK, IDC_BTN_BACK, (WIN_W - 200) / 2, 420, 200, 34);
             break;
         case SCR_CONTINUE:
-            mkbtn(hwnd, B_CONT, IDC_BTN_CONT, 220, 260, 200, 44);
-            mkbtn(hwnd, B_NEW,  IDC_BTN_NEW,  220, 316, 200, 36);
-            mkbtn(hwnd, B_BACK, IDC_BTN_BACK, 220, 364, 200, 30);
+            mkbtn(hwnd, B_CONT, IDC_BTN_CONT, (WIN_W - 200) / 2, 260, 200, 44);
+            mkbtn(hwnd, B_NEW,  IDC_BTN_NEW,  (WIN_W - 200) / 2, 316, 200, 36);
+            mkbtn(hwnd, B_BACK, IDC_BTN_BACK, (WIN_W - 200) / 2, 364, 200, 30);
             break;
         case SCR_WORLD:
             break;
         case SCR_PROF:
-            for (i = 0; i < 3; i++) mkbtn(hwnd, L"", IDC_BTN_P0 + i, 12 + i * 208, 52, 200, 300);
+            /* BUGFIX v0.8: profession cards are centered on the wide screen
+               (old 640-based coords left them crammed in the top-left corner) */
+            for (i = 0; i < 3; i++) mkbtn(hwnd, L"", IDC_BTN_P0 + i, (WIN_W - 624) / 2 + i * 208, 52, 200, 300);
             break;
     }
     InvalidateRect(hwnd, NULL, TRUE);
@@ -1345,6 +1359,22 @@ static void EnterWorld(HWND hwnd)
     SetTimer(hwnd, 2, 50, NULL);   /* mouse-walk / regen tick */
     LayoutForScreen(hwnd);
     SetFocus(hwnd);
+    /* BUGFIX v0.8: the acorn task now starts IMMEDIATELY on entering the
+       world — previously the hero spawned with an empty oak and had to talk
+       to the cat twice (greet + task) before any acorns appeared. */
+    if (g_quest == 0) {
+        wchar_t greet[320];
+        swprintf(greet, 320, D_CAT_NEW, g_nick[0] ? g_nick : L"???");
+        ShowDialogTop(greet);
+        g_catTalked = 1;
+        g_quest = 1;
+    }
+    if (g_quest == 1) {
+        ShowDialogTop(D_CAT_Q1);          /* "collect 3 acorns under the oak" */
+        InvAdd(ITEM_POTION, 2);
+        g_quest = 2;
+        RespawnAcorns();                  /* acorns lie under the oak right now */
+    }
     SaveProfile(); /* real-time: entering the world is persisted instantly */
 }
 
@@ -1550,7 +1580,11 @@ static void TalkSmith(HWND hwnd)
             InvAdd(ITEM_BULAVA, 1); InvAdd(ITEM_LUKO, 1); InvAdd(ITEM_POSOH, 1);
             InvAdd(ITEM_AMULET, 1);
             ShowDialogTop(D_SMITH_GIVE);         /* smith's reply to the ore */
+            /* BUGFIX v0.8: quest bookkeeping — task 2 is handed in at the cat
+               afterwards, but the completion toast fires right here so the
+               player sees feedback immediately. */
             if (g_quest == 3) g_quest = 4;       /* task 2 -> report to the cat */
+            Toast(TST_Q2_DONE);
             SaveProfile();
         } else {
             ShowDialogTop(D_HAND_EMPTY);
@@ -1590,6 +1624,7 @@ static void TalkMarya(HWND hwnd)
             InvAdd(ITEM_HEAVY, 1); InvAdd(ITEM_LEATHER, 1); InvAdd(ITEM_MANTLE, 1);
             ShowDialogTop(D_MARYA_GIVE);         /* Marya's reply to the cloth */
             if (g_quest == 4) g_quest = 5;       /* all 3 done -> cat offers profession */
+            Toast(TST_Q3_DONE);                  /* v0.8: instant feedback */
             SaveProfile();
         } else {
             ShowDialogTop(D_HAND_EMPTY);
@@ -1759,37 +1794,6 @@ static void CastAbility(HWND hwnd, int slot)
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
-static void DrawAbilityBar(HDC hdc)
-{
-    static const wchar_t* AB_KEY[4] = { L"1", L"2", L"3", L"4" };
-    ULONGLONG now = GetTickCount64();
-    int bx = 250, by = 444, bw = 88, gap = 6, i;
-    for (i = 0; i < NABILITY; i++) {
-        Ability* ab = &g_ab[i];
-        RECT r = { bx + i * (bw + gap), by, bx + i * (bw + gap) + bw, by + 30 };
-        ULONGLONG left = 0;
-        HBRUSH b;
-        int ready = !(ab->cd > 1000 && now < ab->cdUntil) && g_energyCur >= ab->cost;
-        b = CreateSolidBrush(ready ? RGB(0x2A,0x30,0x44) : RGB(0x18,0x1A,0x24));
-        FillRect(hdc, &r, b); DeleteObject(b);
-        DrawFrame(hdc, r, ready ? RGB(0xC8,0x9A,0x3E) : RGB(0x55,0x50,0x44));
-        /* cooldown sweep overlay */
-        if (ab->cd > 1000 && now < ab->cdUntil) {
-            RECT cr = r;
-            left = ab->cdUntil - now;
-            cr.left = r.left + (LONG)((double)(r.right - r.left) * (1.0 - (double)left / ab->cd));
-            b = CreateSolidBrush(RGB(0x10,0x12,0x1A));
-            FillRect(hdc, &cr, b); DeleteObject(b);
-        }
-        TextC(hdc, r.left + 4,  r.top + 2, ab->name,   RGB(0xFF,0xF3,0xC0), g_fSmall, 0);
-        TextC(hdc, r.left + 4,  r.top + 16, ab->tag,   ready ? RGB(0x9A,0xAA,0xFF) : RGB(0x77,0x77,0x88), g_fSmall, 0);
-        TextC(hdc, r.right - 12, r.top + 2, AB_KEY[i], RGB(0xE8,0xC8,0x5A), g_fSmall, 0);
-        if (ab->cd > 1000 && left) {
-            wchar_t s[8]; swprintf(s, 8, L"%d", (int)((left + 999) / 1000));
-            TextC(hdc, (r.left + r.right)/2, r.top + 8, s, RGB(0xFF,0xFF,0xFF), g_fMed, 1);
-        }
-    }
-}
 
 static void AdvanceTick(HWND hwnd)
 {

@@ -41,8 +41,8 @@
 #endif
 
 #define NCLASS 3
-#define WIN_W 640
-#define WIN_H 480
+#define WIN_W 1024
+#define WIN_H 768
 
 #define IDC_BTN_START  101
 #define IDC_BTN_LORE   102
@@ -136,6 +136,9 @@ static void UpdateFocus(void);
 static void QuestAdvanceCheck(void);
 static void RespawnAcorns(void);
 static void PickNearbyResource(HWND hwnd);
+static void Toast(const wchar_t* text);
+static int  GroveHasLoot(void);
+static void PaintGroveSpot(HDC hdc);
 static void ShowDialogTop(const wchar_t* fmt, ...);
 static void TalkSmith(HWND hwnd);
 static void TalkMarya(HWND hwnd);
@@ -154,6 +157,14 @@ static wchar_t g_dialogText[512];
 static ULONGLONG g_lastSave = 0;
 static ULONGLONG g_saveFlashUntil = 0;        /* show "saved" indicator briefly */
 
+/* v0.7: world loot at the dark-grove supply spot (metal shard + cloth scrap).
+   The cat sends the hero here after task 1, so these must exist in the world
+   and respawn once both have been handed over to the masters. */
+static int  g_lootMetal = 0;                  /* 0 = lying at the spot, 1 = taken */
+static int  g_lootCloth = 0;
+static ULONGLONG g_toastUntil = 0;            /* quest-completion popup (5 s) */
+static wchar_t g_toastText[192];
+
 /* Mouse-to-walk destination (click where to go) */
 static int g_walkDestSet = 0;
 static int g_walkX = 0, g_walkY = 0;
@@ -165,7 +176,7 @@ static ULONGLONG g_lastRegen = 0;             /* passive energy regen tick */
 
 /* Acorns under the oak (fixed positions, respawn per session only) */
 typedef struct { int x, y, taken; } Acorn;
-static Acorn g_acorns_arr[3] = { {262,196,0}, {352,214,0}, {300,252,0} };
+static Acorn g_acorns_arr[3] = { {470,290,0}, {560,306,0}, {512,336,0} };
 
 /* ======================= v0.4: items, inventory, NPCs, quests ============ */
 enum { ITEM_ACORN=1, ITEM_METAL, ITEM_CLOTH, ITEM_POTION, ITEM_AMULET,
@@ -210,18 +221,18 @@ static wchar_t g_focusName[64] = L"";
 static wchar_t g_speaker[64] = L"";   /* who said the current line */
 
 /* NPC positions */
-#define SMITH_X 96
+#define SMITH_X 260
 #define SMITH_Y 216
-#define MARYA_X 548
+#define MARYA_X 772
 #define MARYA_Y 214
-#define SPOT_X  560
-#define SPOT_Y  360
+#define SPOT_X  860
+#define SPOT_Y  470
 
 #define WORLD_TOP 96
-#define OAK_X 300
-#define OAK_Y 190
-#define CAT_X 392
-#define CAT_Y 236
+#define OAK_X 512
+#define OAK_Y 250
+#define CAT_X 620
+#define CAT_Y 300
 #define PICK_R 26
 #define TALK_R 46
 #define WALK_SPEED 5      /* px per tick (tick = 50 ms) -> ~100 px/s */
@@ -471,14 +482,16 @@ static void SaveProfile(void)
             "  \"quest\": { \"step\": %d, \"q\": %d, \"acorns\": %d, \"catTalked\": %s, \"smith\": %d, \"marya\": %d },\n"
             "  \"equip\": { \"w\": %d, \"a\": %d, \"r\": %d },\n"
             "  \"inventory\": %s,\n"
-            "  \"acornTaken\": [%d, %d, %d]\n"
+            "  \"acornTaken\": [%d, %d, %d],\n"
+            "  \"loot\": [%d, %d]\n"
             "}\n",
             stamp, nutf, g_selected, g_hpCur, g_hpMax, g_energyCur,
             g_level, g_profBonus, g_youngster, g_px, g_py,
             g_questStep, g_quest, g_acorns, g_catTalked ? "true" : "false",
             g_smithStage, g_maryaStage,
             g_equipW, g_equipA, g_equipR, invJson,
-            g_acorns_arr[0].taken, g_acorns_arr[1].taken, g_acorns_arr[2].taken);
+            g_acorns_arr[0].taken, g_acorns_arr[1].taken, g_acorns_arr[2].taken,
+            g_lootMetal, g_lootCloth);
     }
     fclose(f);
 
@@ -565,8 +578,16 @@ static int LoadProfile(void) /* returns 1 if a valid profile was loaded */
         g_hpCur      = JsonGetInt(buf, "hp", g_hpMax);
         g_energyCur  = JsonGetInt(buf, "energy", g_energyMax);
         if (g_energyCur > g_energyMax) g_energyCur = g_energyMax;
-        g_px         = JsonGetInt(buf, "x", 320);
-        g_py         = JsonGetInt(buf, "y", 380);
+        g_px         = JsonGetInt(buf, "x", 512);
+        g_py         = JsonGetInt(buf, "y", 470);
+        /* v0.7: migrate old 640x480 coordinates into the new 1024x768 village */
+        if (g_px < 640 && g_py < 480) {
+            int ox = g_px;
+            g_px = g_px * 1024 / 640;
+            g_py = g_py == 380 ? 470 : (g_py == 480 - 40 ? 768 - 40 : g_py + 120);
+            if (ox <= 320 && g_px > 172 && g_px < 348 && g_py > 116 && g_py < 204)
+                g_px = 420;   /* pushed out of the smith hut footprint */
+        }
         g_questStep  = JsonGetInt(buf, "step", 0);
         g_quest      = JsonGetInt(buf, "q", 0);
         g_acorns     = JsonGetInt(buf, "acorns", 0);
@@ -590,6 +611,14 @@ static int LoadProfile(void) /* returns 1 if a valid profile was loaded */
           } else {
             for (i = 0; i < 3; i++) g_acorns_arr[i].taken = 0;
           } }
+        /* v0.7: grove loot state ("loot": [metal, cloth]) */
+        { const char* p = strstr(buf, "\"loot\"");
+          if (p && strchr(p, '[')) {
+            p = strchr(p, '[') + 1;
+            g_lootMetal = (int)strtol(p, (char**)&p, 10);
+            while (*p == ',' || *p == ' ') p++;
+            g_lootCloth = (int)strtol(p, NULL, 10);
+          } else { g_lootMetal = 0; g_lootCloth = 0; } }
         /* equipment */
         g_equipW = JsonGetInt(buf, "w", 0);
         g_equipA = JsonGetInt(buf, "a", 0);
@@ -1067,15 +1096,42 @@ static void PaintAbilityBar(HDC hdc)
 /* --- Dialog window: right side, vertically centered ----------------------- */
 static void PaintDialogBox(HDC hdc)
 {
-    RECT r = { WIN_W - 330, WIN_H/2 - 90, WIN_W - 14, WIN_H/2 + 90 };
-    HBRUSH br;
+    RECT r = { WIN_W - 360, WIN_H/2 - 130, WIN_W - 14, WIN_H/2 + 130 };
+    RECT tr; HBRUSH br;
     if (!g_dialogShown) return;
     br = CreateSolidBrush(RGB(0x14,0x18,0x28));
     FillRect(hdc, &r, br); DeleteObject(br);
     DrawFrameAt(hdc, r, RGB(0xE8,0xC8,0x5A));
     TextL(hdc, r.left + 12, r.top + 8,
           g_speaker[0] ? g_speaker : CAT_NAME, RGB(0xE8,0xC8,0x5A), g_fMed);
-    TextL(hdc, r.left + 12, r.top + 34, g_dialogText, RGB(0xF0,0xF0,0xF0), g_fSmall);
+    /* BUGFIX v0.7: long NPC lines used to run past the panel edge — draw with
+       word wrapping inside the frame instead of a single TextL line. */
+    tr.left = r.left + 12; tr.top = r.top + 40;
+    tr.right = r.right - 12; tr.bottom = r.bottom - 10;
+    SetBkMode(hdc, TRANSPARENT);
+    SelectObject(hdc, g_fSmall);
+    SetTextColor(hdc, RGB(0xF0,0xF0,0xF0));
+    DrawTextW(hdc, g_dialogText, -1, &tr, DT_LEFT | DT_WORDBREAK);
+}
+
+/* v0.7: quest-completion popup — 5 s banner under the HUD strip */
+static void PaintToast(HDC hdc)
+{
+    SIZE sz; wchar_t b[224]; RECT r; HBRUSH br;
+    if (!g_toastUntil || GetTickCount64() > g_toastUntil) return;
+    swprintf(b, 224, L"\x2726 %ls \x2726", g_toastText);   /* ✦ text ✦ */
+    SetBkMode(hdc, TRANSPARENT);
+    SelectObject(hdc, g_fMed);
+    GetTextExtentPoint32W(hdc, b, (int)lstrlenW(b), &sz);
+    {
+        int w = sz.cx + 44, hgt = 44;
+        int x = (WIN_W - w) / 2, y = WORLD_TOP + 14;
+        r.left = x; r.top = y; r.right = x + w; r.bottom = y + hgt;
+        br = CreateSolidBrush(RGB(0x1E,0x2A,0x1E));
+        FillRect(hdc, &r, br); DeleteObject(br);
+        DrawFrameAt(hdc, r, RGB(0x9A,0xE0,0x9A));
+        TextC(hdc, WIN_W/2, y + 12, b, RGB(0xD8,0xF0,0xC8), g_fMed, 1);
+    }
 }
 
 static void PaintWorld(HDC hdc)
@@ -1093,11 +1149,11 @@ static void PaintWorld(HDC hdc)
       SelectObject(hdc, o); }
     DeleteObject(pen);
     /* road */
-    RectFill(hdc, 0, 250, WIN_W, 60, RGB(0x3A,0x34,0x2A));
+    RectFill(hdc, 0, 300, WIN_W, 60, RGB(0x3A,0x34,0x2A));
     /* huts: smith (left) and marya (right) */
     for (i = 0; i < 2; i++) {
-        int hx = i == 0 ? SMITH_X - 44 : MARYA_X - 44;
-        RECT hr = { hx, 120, hx + 88, 200 };
+        int hx = i == 0 ? SMITH_X - 66 : MARYA_X - 66;
+        RECT hr = { hx, 116, hx + 132, 204 };
         br = CreateSolidBrush(RGB(0x6A,0x4A,0x2A));
         FillRect(hdc, &hr, br); DeleteObject(br);
         pen = CreatePen(PS_SOLID, 2, RGB(0x3A,0x2A,0x1A));
@@ -1121,9 +1177,8 @@ static void PaintWorld(HDC hdc)
     DeleteObject(br);
     FillEllipse(hdc, OAK_X, OAK_Y - 14, 52, 38, RGB(0x2A,0x5A,0x2A));
     TextC(hdc, OAK_X, OAK_Y + 62, T_OAK, RGB(0xC8,0xC8,0xD8), g_fSmall, 1);
-    /* dark grove spot */
-    FillEllipse(hdc, SPOT_X, SPOT_Y, 40, 26, RGB(0x14,0x20,0x18));
-    TextC(hdc, SPOT_X, SPOT_Y - 4, T_SPOT, RGB(0x7A,0x8A,0x7A), g_fSmall, 1);
+    /* dark grove spot (v0.7: shows remaining loot) */
+    PaintGroveSpot(hdc);
     /* acorns: small nut with cap (matches the IT_ACORN icon color) */
     for (i = 0; i < 3; i++) {
         if (g_acorns_arr[i].taken) continue;
@@ -1169,6 +1224,7 @@ static void PaintWorld(HDC hdc)
     PaintAbilityBar(hdc);
     PaintInventory(hdc);
     PaintDialogBox(hdc);
+    PaintToast(hdc);
     /* quest tracker under focus info */
     {
         const wchar_t* qtxt;
@@ -1348,6 +1404,43 @@ static void RespawnAcorns(void)
     if (allTaken) memset(g_acorns_arr, 0, sizeof(g_acorns_arr));
 }
 
+/* v0.7: 5-second quest-completion popup (top-center, above the HUD strip) */
+static void Toast(const wchar_t* text)
+{
+    lstrcpynW(g_toastText, text, 192);
+    g_toastUntil = GetTickCount64() + 5000;
+}
+
+/* v0.7: is there still loot at the dark-grove supply spot? */
+static int GroveHasLoot(void)
+{
+    return (!g_lootMetal && InvCount(ITEM_METAL) == 0) ||
+           (!g_lootCloth && InvCount(ITEM_CLOTH) == 0);
+}
+
+/* Draw the supply spot: mound + visible shards/scrap when uncollected */
+static void PaintGroveSpot(HDC hdc)
+{
+    FillEllipse(hdc, SPOT_X, SPOT_Y, 40, 26, RGB(0x14,0x20,0x18));
+    if (!g_lootMetal || !g_lootCloth) {
+        HPEN op, lp2;
+        RECT mound = { SPOT_X - 20, SPOT_Y - 6, SPOT_X + 20, SPOT_Y + 10 };
+        HBRUSH mb = CreateSolidBrush(RGB(0x2A,0x36,0x2A));
+        FillRect(hdc, &mound, mb); DeleteObject(mb);
+        op = GetStockObject(NULL_PEN);
+        lp2 = CreatePen(PS_SOLID, 4, RGB(0x9A,0x9A,0xA6));   /* iron shard */
+        SelectObject(hdc, lp2);
+        if (!g_lootMetal) { MoveToEx(hdc, SPOT_X - 16, SPOT_Y + 6, NULL); LineTo(hdc, SPOT_X - 4, SPOT_Y - 6); }
+        DeleteObject(lp2);
+        lp2 = CreatePen(PS_SOLID, 4, RGB(0xE8,0xE0,0xC8));   /* linen scrap */
+        SelectObject(hdc, lp2);
+        if (!g_lootCloth) { MoveToEx(hdc, SPOT_X + 4, SPOT_Y + 6, NULL); LineTo(hdc, SPOT_X + 16, SPOT_Y - 6); }
+        DeleteObject(lp2);
+        SelectObject(hdc, op);
+    }
+    TextC(hdc, SPOT_X, SPOT_Y - 24, T_SPOT, RGB(0x7A,0x8A,0x7A), g_fSmall, 1);
+}
+
 static void TalkCat(HWND hwnd)
 {
     if (g_dialogShown) { g_dialogShown = 0; InvalidateRect(hwnd, NULL, FALSE); return; }
@@ -1379,7 +1472,13 @@ static void TalkCat(HWND hwnd)
             return;
         case 2:
             if (g_acorns >= 3) {
+                /* BUGFIX v0.7: hand out the materials HERE, the moment the
+                   acorns are returned — previously the player got nothing to
+                   carry to the smith/Marya and the chain stalled. */
                 ShowDialogTop(D_CAT_Q2);
+                if (InvCount(ITEM_METAL) == 0) { InvAdd(ITEM_METAL, 1); g_lootMetal = 1; }
+                if (InvCount(ITEM_CLOTH) == 0) { InvAdd(ITEM_CLOTH, 1); g_lootCloth = 1; }
+                Toast(TST_Q1_DONE);
                 g_quest = 3;
             } else {
                 wchar_t b[128];
@@ -1398,6 +1497,9 @@ static void TalkCat(HWND hwnd)
                 InvRemove(ITEM_ACORN, 3);
                 RespawnAcorns();                 /* oak restocks for the grind */
                 ShowDialogTop(D_CAT_Q2);
+                if (InvCount(ITEM_METAL) == 0) { InvAdd(ITEM_METAL, 1); g_lootMetal = 1; }
+                if (InvCount(ITEM_CLOTH) == 0) { InvAdd(ITEM_CLOTH, 1); g_lootCloth = 1; }
+                Toast(TST_Q1_DONE);
                 g_quest = 3;
             } else {
                 wchar_t b[128];
@@ -1526,6 +1628,7 @@ static void ChooseProfession(HWND hwnd, int idx)
     g_quest = 6;
     pnames[0] = PR_WARRIOR; pnames[1] = PR_HUNTER; pnames[2] = PR_MAGUS;
     swprintf(b, 256, D_PROF_DONE, pnames[idx]);
+    Toast(TST_PROF_UP);
     BuildAbilities();
     SaveProfile();
     g_screen = SCR_WORLD;
@@ -1577,9 +1680,9 @@ static int BlockedAt(int nx, int ny)
     if (nx < 14 || nx > WIN_W - 14) return 1;
     if (ny < 96  || ny > WIN_H - 40) return 1;
     if (abs(nx - OAK_X) < 16 && ny > OAK_Y && ny < OAK_Y + 50) return 1; /* trunk */
-    if (nx > 40 && nx < 136 && ny > 120 && ny < 200) return 1;            /* hut1 */
-    if (nx > 500 && nx < 600 && ny > 118 && ny < 200) return 1;           /* hut2 */
-    if (nx > 150 && nx < 190 && ny > 250 && ny < 276) return 1;           /* well */
+    if (nx > 172 && nx < 348 && ny > 116 && ny < 204) return 1;           /* smith hut */
+    if (nx > 684 && nx < 860 && ny > 116 && ny < 204) return 1;           /* marya hut */
+    if (nx > 300 && nx < 344 && ny > 400 && ny < 436) return 1;           /* well */
     return 0;
 }
 
@@ -1700,6 +1803,7 @@ static void AdvanceTick(HWND hwnd)
         }
         if (g_buffUntil && now > g_buffUntil) { g_buffUntil = 0; changed = 1; }
         if (g_dialogShown && now > g_dialogUntil) { g_dialogShown = 0; changed = 1; }
+        if (g_toastUntil && now > g_toastUntil) { g_toastUntil = 0; changed = 1; }
         if (changed) InvalidateRect(hwnd, NULL, FALSE);
     }
 }
@@ -1856,10 +1960,34 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         return 0;
                     }
                 }
+                /* v0.7: single click on an inventory slot equips/drinks too */
+                if (g_invOpen) {
+                    int ii;
+                    for (ii = 0; ii < g_invGridN; ii++) {
+                        RECT sr = g_invRects[ii];
+                        if (mx0 >= sr.left && mx0 < sr.right && my0 >= sr.top && my0 < sr.bottom) {
+                            InvSlotAction(hwnd, ii);
+                            return 0;
+                        }
+                    }
+                }
                 if (g_dialogShown) { g_dialogShown = 0; InvalidateRect(hwnd, NULL, FALSE); }
                 else {
                     /* mouse-to-walk: hero walks to the clicked point */
                     int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp);
+                    /* v0.7: clicking an acorn right next to the hero picks it
+                       up instantly (same rules as the hotbar "Сбор" button) */
+                    {
+                        int ai, hit = -1; double bd = 1e9;
+                        for (ai = 0; ai < 3; ai++) {
+                            double ax, ay, ad;
+                            if (g_acorns_arr[ai].taken) continue;
+                            ax = g_acorns_arr[ai].x - g_px; ay = g_acorns_arr[ai].y - g_py;
+                            ad = sqrt(ax*ax + ay*ay);
+                            if (ad < PICK_R + 6 && ad < bd) { bd = ad; hit = ai; }
+                        }
+                        if (hit >= 0) { TryPickAcorn(hwnd); return 0; }
+                    }
                     if (mx >= 14 && mx <= WIN_W - 14 && my >= 96 && my <= WIN_H - 40 &&
                         !BlockedAt(mx, my)) {
                         g_walkX = mx; g_walkY = my; g_walkDestSet = 1;
@@ -1900,7 +2028,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     g_equipW = 0; g_equipA = 0; g_equipR = 0;
                     memset(g_inv, 0, sizeof(g_inv));
                     memset(g_acorns_arr, 0, sizeof(g_acorns_arr));
-                    g_px = 320; g_py = 380;
+                    g_lootMetal = 0; g_lootCloth = 0;
+                    g_px = 512; g_py = 470;
                     hasProfile = 1;
                     SaveProfile(); /* real-time: character creation persists now */
                     EnterWorld(hwnd);
@@ -1920,6 +2049,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     g_equipW = 0; g_equipA = 0; g_equipR = 0;
                     memset(g_inv, 0, sizeof(g_inv));
                     memset(g_acorns_arr, 0, sizeof(g_acorns_arr));
+                    g_lootMetal = 0; g_lootCloth = 0;
                     ProfilePathW(wpath, MAX_PATH);   /* wipe the old save file */
                     DeleteFileW(wpath);
                     g_screen = SCR_SELECT;

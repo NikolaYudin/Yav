@@ -842,10 +842,12 @@ static void PaintSelect(HWND hwnd, HDC hdc)
 /* --- Profession choice screen (after all 3 poruchenija) ------------------- */
 static void PaintProfession(HWND hwnd, HDC hdc)
 {
-    static const wchar_t* names[3] = { PR_WARRIOR, PR_HUNTER, PR_MAGUS };
-    static const wchar_t* descs[3] = { PD_WARRIOR, PD_HUNTER, PD_MAGUS };
-    static const COLORREF cols[3]  = { RGB(0x2F,0x3A,0x8B), RGB(0x3A,0x6B,0x3F), RGB(0x7A,0x4A,0x4A) };
+    const wchar_t* names[3];
+    const wchar_t* descs[3];
+    const COLORREF cols[3] = { RGB(0x2F,0x3A,0x8B), RGB(0x3A,0x6B,0x3F), RGB(0x7A,0x4A,0x4A) };
     int i;
+    names[0] = PR_WARRIOR; names[1] = PR_HUNTER; names[2] = PR_MAGUS;
+    descs[0] = PD_WARRIOR; descs[1] = PD_HUNTER; descs[2] = PD_MAGUS;
     (void)hwnd;
     RectFill(hdc, 0, 0, WIN_W, WIN_H, RGB(0x08,0x0A,0x12));
     TextC(hdc, WIN_W/2, 14, PROF_TITLE, RGB(0xE8,0xC8,0x5A), g_fMed, 1);
@@ -1274,11 +1276,11 @@ static void TalkCat(HWND hwnd)
     /* step machine:
        0 not greeted -> greet, start task1
        1 greeted     -> give acorn task + starter items (metal/cloth/potion)
-       2 acorns pending
-       3 smith pending
-       4 marya pending
-       5 all done -> profession choice screen
-       6 hero (profession chosen) */
+       2 task1: collect 3 acorns under the oak
+       3 task2: hand metal to the smith (report back here when done)
+       4 task3: hand cloth to Marya (report back here when done)
+       5 all done   -> profession choice screen (Воин/Лучник/Волхв)
+       6 hero       (profession chosen) */
     switch (g_quest) {
         case 0: {
             wchar_t greet[320];
@@ -1297,7 +1299,6 @@ static void TalkCat(HWND hwnd)
             return;
         case 2:
             if (g_acorns >= 3) {
-                InvAdd(ITEM_ACORN, 0);
                 ShowDialogTop(D_CAT_Q2);
                 g_quest = 3;
             } else {
@@ -1308,13 +1309,32 @@ static void TalkCat(HWND hwnd)
             SaveProfile();
             return;
         case 3:
-            ShowDialogTop(g_smithStage >= 3 ? D_CAT_Q3 : D_CAT_NEED2);
-            if (g_smithStage >= 3) g_quest = 4;
+            /* reporting on task 2: smith gave the weapon already? */
+            if (g_smithStage >= 3 || InvCount(ITEM_BULAVA) > 0) {
+                g_smithStage = 3; g_quest = 4;
+                ShowDialogTop(D_CAT_Q3);
+            } else if (g_acorns >= 3) {
+                /* hand over the acorns here -> cat sends to the smith */
+                InvRemove(ITEM_ACORN, 3);
+                ShowDialogTop(D_CAT_Q2);
+                g_quest = 3;
+            } else {
+                wchar_t b[128];
+                swprintf(b, 128, D_CAT_PROGRESS, g_acorns);
+                ShowDialogTop(b);
+            }
             SaveProfile();
             return;
         case 4:
-            ShowDialogTop(g_maryaStage >= 3 ? D_CAT_FINAL : D_CAT_NEED3);
-            if (g_maryaStage >= 3) g_quest = 5;
+            /* reporting on task 3: Marya wove the garment already? */
+            if (g_maryaStage >= 3 || InvCount(ITEM_HEAVY) > 0) {
+                g_maryaStage = 3; g_quest = 5;
+                ShowDialogTop(D_CAT_FINAL);
+                g_screen = SCR_PROF;           /* open profession choice overlay */
+                LayoutForScreen(hwnd);
+            } else {
+                ShowDialogTop(D_CAT_NEED3);
+            }
             SaveProfile();
             return;
         case 5:
@@ -1342,10 +1362,11 @@ static void TalkSmith(HWND hwnd)
     if (g_smithStage == 0) {
         if (InvCount(ITEM_METAL) > 0 && g_quest >= 2) {
             InvRemove(ITEM_METAL, 1);
-            g_smithStage = 2;                    /* crafting */
-            g_smithDoneAt = now + 4000;          /* 4 seconds of forge work */
-            ShowDialogTop(D_SMITH_GIVE);
-            if (g_quest == 2) g_quest = 3;       /* acorns already done? keep as is */
+            g_smithStage = 3;                    /* forged right away (demo pacing) */
+            InvAdd(ITEM_BULAVA, 1); InvAdd(ITEM_LUKO, 1); InvAdd(ITEM_POSOH, 1);
+            InvAdd(ITEM_AMULET, 1);
+            ShowDialogTop(D_SMITH_GIVE);         /* smith's reply to the ore */
+            if (g_quest == 3) g_quest = 4;       /* task 2 -> report to the cat */
             SaveProfile();
         } else {
             ShowDialogTop(D_HAND_EMPTY);
@@ -1358,12 +1379,17 @@ static void TalkSmith(HWND hwnd)
             InvAdd(ITEM_BULAVA, 1); InvAdd(ITEM_LUKO, 1); InvAdd(ITEM_POSOH, 1);
             InvAdd(ITEM_AMULET, 1);
             ShowDialogTop(D_SMITH_GOLD);
-            if (g_quest == 3 && g_maryaStage >= 3) g_quest = 5;
+            if (g_quest == 3) g_quest = 4;       /* advance after smith done */
             SaveProfile();
         } else {
             ShowDialogTop(D_SMITH_WAIT);
         }
         return;
+    }
+    /* stage 3: hand over the acorns here to finish task 2 (old saves compat) */
+    if (g_quest == 3 && g_acorns >= 3) {
+        g_quest = 4;
+        SaveProfile();
     }
     ShowDialogTop(D_SMITH_GOLD);   /* already armed: hint */
     (void)hwnd;
@@ -1376,9 +1402,10 @@ static void TalkMarya(HWND hwnd)
     if (g_maryaStage == 0) {
         if (InvCount(ITEM_CLOTH) > 0 && g_quest >= 2) {
             InvRemove(ITEM_CLOTH, 1);
-            g_maryaStage = 2;
-            g_maryaDoneAt = now + 4000;
-            ShowDialogTop(D_MARYA_GIVE);
+            g_maryaStage = 3;                    /* woven right away (demo pacing) */
+            InvAdd(ITEM_HEAVY, 1); InvAdd(ITEM_LEATHER, 1); InvAdd(ITEM_MANTLE, 1);
+            ShowDialogTop(D_MARYA_GIVE);         /* Marya's reply to the cloth */
+            if (g_quest == 4) g_quest = 5;       /* all 3 done -> cat offers profession */
             SaveProfile();
         } else {
             ShowDialogTop(D_HAND_EMPTY);
@@ -1390,13 +1417,15 @@ static void TalkMarya(HWND hwnd)
             g_maryaStage = 3;
             InvAdd(ITEM_HEAVY, 1); InvAdd(ITEM_LEATHER, 1); InvAdd(ITEM_MANTLE, 1);
             ShowDialogTop(D_MARYA_GOLD);
-            if (g_quest == 3 && g_smithStage >= 3) g_quest = 5;
+            if (g_quest == 4) g_quest = 5;
             SaveProfile();
         } else {
             ShowDialogTop(D_MARYA_WAIT);
         }
         return;
     }
+    /* stage 3: finish task 3 bookkeeping for old saves */
+    if (g_quest == 4) { g_quest = 5; SaveProfile(); }
     ShowDialogTop(D_MARYA_GOLD);
     (void)hwnd;
 }
@@ -1752,6 +1781,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         case WM_COMMAND:
             switch (LOWORD(wp)) {
+                case IDC_BTN_P0: case IDC_BTN_P1: case IDC_BTN_P2:
+                    ChooseProfession(hwnd, (int)LOWORD(wp) - IDC_BTN_P0);
+                    break;
                 case IDC_BTN_START:
                     if (hasProfile == 1) { g_screen = SCR_CONTINUE; }
                     else                 { g_screen = SCR_SELECT; }

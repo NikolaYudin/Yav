@@ -170,7 +170,6 @@ enum { ITEM_ACORN=1, ITEM_METAL, ITEM_CLOTH, ITEM_POTION, ITEM_AMULET,
 enum { CAT_W=0, WARRIOR_W=1, HUNTER_W=2, MAGUS_W=3 };   /* weapon classes */
 typedef struct { int id; const wchar_t* name; COLORREF col; int wcls, bonus; } ItemDef;
 static ItemDef g_items[12];
-#define NITEMS 12
 static void InitItems(void)
 {
     int k = 0;
@@ -366,6 +365,28 @@ static int ToggleEquip(HWND hwnd, int id)
 /* click on inventory grid -> item index or -1 (rect set in DrawInventory) */
 static RECT g_invRects[INV_CAP];
 static int  g_invGridN = 0;
+
+/* double-click on a slot: equip/unequip, potions drink directly from bag */
+static void InvSlotAction(HWND hwnd, int idx)
+{
+    if (idx < 0 || idx >= INV_CAP) return;
+    if (!g_inv[idx].id) return;
+    if (g_inv[idx].id == ITEM_POTION) {
+        int r = 30;
+        InvRemove(ITEM_POTION, 1);
+        g_hpCur += r; if (g_hpCur > g_hpMax) g_hpCur = g_hpMax;
+        lstrcpynW(g_speaker, IT_POTION, 64);
+        ShowDialogTop(D_POTION, r);
+        SaveProfile();
+        InvalidateRect(hwnd, NULL, FALSE);
+        return;
+    }
+    ToggleEquip(hwnd, g_inv[idx].id);
+}
+
+/* --------------------- v0.4: dialog + launch/select paint ----------------- */
+/* NOTE: ShowDialogTop / PaintLaunch / PaintSelect are defined further below,
+   after the rendering primitives (RectFill/TextC/FillCircle) they use. */
 
 /* --------------------------- File DB (real time) ------------------------- */
 static void ProfilePathW(wchar_t* out, size_t cch)
@@ -754,9 +775,108 @@ static void DrawDialogBox(HDC hdc)
 
 static void DrawFrameAt(HDC hdc, RECT r, COLORREF c);
 
-/* --- HUD: player info panel (top-left) ----------------------------------- */
+/* --------------------- v0.4: dialog + launch/select paint ----------------- */
+/* Variadic dialog writer: shows text in the right-side dialog window and
+   remembers the speaker (cat / smith / marya) by format-string identity. */
+static void ShowDialogTop(const wchar_t* fmt, ...)
+{
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnwprintf(g_dialogText, 511, fmt, ap);
+    g_dialogText[511] = 0;
+    va_end(ap);
+    if      (fmt == D_SMITH_GIVE || fmt == D_SMITH_WAIT || fmt == D_SMITH_GOLD)
+        lstrcpynW(g_speaker, NPC_SMITH, 64);
+    else if (fmt == D_MARYA_GIVE || fmt == D_MARYA_WAIT || fmt == D_MARYA_GOLD)
+        lstrcpynW(g_speaker, NPC_MARYA, 64);
+    else if (fmt == D_CAT_NEW || fmt == D_CAT_Q1 || fmt == D_CAT_Q2 ||
+             fmt == D_CAT_Q3 || fmt == D_CAT_FINAL || fmt == D_CAT_NEED2 ||
+             fmt == D_CAT_NEED3 || fmt == D_CAT_AGAIN || fmt == D_PROF_DONE)
+        lstrcpynW(g_speaker, CAT_NAME, 64);
+    g_dialogShown = 1;
+    g_dialogUntil = GetTickCount64() + 9000;
+}
+
+/* --- Launch screen (logo art; buttons are owner-draw children) ------------ */
+static void PaintLaunch(HWND hwnd, HDC hdc)
+{
+    (void)hwnd;
+    RectFill(hdc, 0, 0, WIN_W, WIN_H, RGB(0x0C,0x10,0x1A));
+    FillCircle(hdc, WIN_W/2, 128, 56, RGB(0x1B,0x24,0x3A));
+    FillCircle(hdc, WIN_W/2, 128, 44, RGB(0xC8,0x9A,0x3E));
+    FillCircle(hdc, WIN_W/2 - 16, 116, 36, RGB(0x1B,0x24,0x3A));
+    TextC(hdc, WIN_W/2, 106, S_LOGO, RGB(0x0C,0x10,0x1A), g_fTitle, 1);
+    TextC(hdc, WIN_W/2, 208, APP_TITLE, RGB(0xE8,0xC8,0x5A), g_fBig, 1);
+    TextC(hdc, WIN_W/2, 246, S_SLOGAN, RGB(0x9A,0xAA,0xC0), g_fMed, 1);
+    TextC(hdc, WIN_W/2, 452, S_SUBT, RGB(0x5A,0x66,0x7A), g_fSmall, 1);
+}
+
+/* --- Class select: three cards (buttons IDC_CARD_0..2 overlay this art) --- */
+static void PaintSelect(HWND hwnd, HDC hdc)
+{
+    int i;
+    (void)hwnd;
+    RectFill(hdc, 0, 0, WIN_W, WIN_H, RGB(0x10,0x14,0x20));
+    TextC(hdc, WIN_W/2, 10, H_SEL0, RGB(0xE8,0xC8,0x5A), g_fMed, 1);
+    for (i = 0; i < NCLASS; i++) {
+        int x = 12 + i * 208, y = 44, w = 200, h = 256;
+        const wchar_t* s = g_class[i].desc;
+        int ly = y + 128;
+        FillCircle(hdc, x + w/2, y + 44, 26, g_class[i].color);
+        FillCircle(hdc, x + w/2, y + 44, 10, RGB(0xE8,0xC8,0x9A));
+        TextC(hdc, x + w/2, y + 80, g_class[i].name, RGB(0xFF,0xF3,0xC0), g_fMed, 1);
+        TextC(hdc, x + w/2, y + 104, g_class[i].tag, RGB(0x9A,0xAA,0xC0), g_fSmall, 1);
+        while (*s && ly < y + h - 26) {           /* naive wrap ~26 chars */
+            wchar_t line[32]; int n = 0;
+            while (s[n] && n < 26) n++;
+            if (s[n] && s[n] != L' ') { while (n > 0 && s[n-1] != L' ') n--; if (!n) n = 26; }
+            wcsncpy(line, s, n); line[n] = 0;
+            TextC(hdc, x + w/2, ly, line, RGB(0xC8,0xC8,0xD8), g_fSmall, 1);
+            s += n; while (*s == L' ') s++;
+            ly += 17;
+        }
+    }
+    TextL(hdc, 132, 312, L"\x0418\x043c\x044f \x0433\x0435\x0440\x043e\x044f:", RGB(0x9A,0xAA,0xC0), g_fSmall);
+}
+
+/* --- Profession choice screen (after all 3 poruchenija) ------------------- */
+static void PaintProfession(HWND hwnd, HDC hdc)
+{
+    static const wchar_t* names[3] = { PR_WARRIOR, PR_HUNTER, PR_MAGUS };
+    static const wchar_t* descs[3] = { PD_WARRIOR, PD_HUNTER, PD_MAGUS };
+    static const COLORREF cols[3]  = { RGB(0x2F,0x3A,0x8B), RGB(0x3A,0x6B,0x3F), RGB(0x7A,0x4A,0x4A) };
+    int i;
+    (void)hwnd;
+    RectFill(hdc, 0, 0, WIN_W, WIN_H, RGB(0x08,0x0A,0x12));
+    TextC(hdc, WIN_W/2, 14, PROF_TITLE, RGB(0xE8,0xC8,0x5A), g_fMed, 1);
+    for (i = 0; i < 3; i++) {
+        int x = 12 + i * 208, y = 52, w = 200, h = 300;
+        RECT cr = { x, y, x + w, y + h };
+        HBRUSH b = CreateSolidBrush(RGB(0x1A,0x1E,0x2C));
+        const wchar_t* s = descs[i];
+        int ly = y + 104;
+        FillRect(hdc, &cr, b); DeleteObject(b);
+        DrawFrameAt(hdc, cr, cols[i]);
+        FillCircle(hdc, x + w/2, y + 40, 24, cols[i]);
+        TextC(hdc, x + w/2, y + 76, names[i], RGB(0xFF,0xF3,0xC0), g_fMed, 1);
+        while (*s && ly < y + h - 34) {
+            wchar_t line[32]; int n = 0;
+            while (s[n] && n < 24) n++;
+            if (s[n] && s[n] != L' ') { while (n > 0 && s[n-1] != L' ') n--; if (!n) n = 24; }
+            wcsncpy(line, s, n); line[n] = 0;
+            TextC(hdc, x + w/2, ly, line, RGB(0xC8,0xC8,0xD8), g_fSmall, 1);
+            s += n; while (*s == L' ') s++;
+            ly += 17;
+        }
+        { wchar_t kb[16]; swprintf(kb, 16, L"[\u041a\u043b\u0430\u0432\u0438\u0448\u0430 %d]", i + 1);
+          TextC(hdc, x + w/2, y + h - 26, kb, RGB(0xE8,0xC8,0x5A), g_fSmall, 1); }
+    }
+    TextC(hdc, WIN_W/2, 448, B_PROFIT, RGB(0x9A,0xAA,0xC0), g_fSmall, 1);
+}
+
 static void PaintPlayerPanel(HDC hdc)
 {
+    /* top-left corner: nickname, level, health + mana bars */
     RECT r = { 10, 10, 250, 96 };
     wchar_t b[128];
     HBRUSH br;
@@ -1059,6 +1179,7 @@ static void OnPaint(HWND hwnd)
             break;
         case SCR_CONTINUE: PaintContinue(hwnd, mem); break;
         case SCR_WORLD:    PaintWorld(mem);          break;
+        case SCR_PROF:     PaintProfession(hwnd, mem); break;
     }
     BitBlt(hdc, 0, 0, WIN_W, WIN_H, mem, 0, 0, SRCCOPY);
     SelectObject(mem, old);
@@ -1078,6 +1199,7 @@ static BOOL CALLBACK DestroyChildCb(HWND c, LPARAM l) { (void)l; DestroyWindow(c
 
 static void LayoutForScreen(HWND hwnd)
 {
+    int i;
     /* remove all controls, recreate per screen */
     EnumChildWindows(hwnd, DestroyChildCb, 0);
     g_editNick = NULL;
@@ -1088,8 +1210,7 @@ static void LayoutForScreen(HWND hwnd)
             mkbtn(hwnd, B_LORE,  IDC_BTN_LORE,  220, 370, 200, 34);
             mkbtn(hwnd, B_EXIT,  IDC_BTN_QUIT,  220, 414, 200, 34);
             break;
-        case SCR_SELECT: {
-            int i;
+        case SCR_SELECT:
             for (i = 0; i < NCLASS; i++) mkbtn(hwnd, L"", IDC_CARD_0 + i, 12 + i * 208, 44, 200, 256);
             g_editNick = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE | WS_BORDER | ES_AUTOHSCROLL,
                                          130, 310, 300, 24, hwnd, (HMENU)(INT_PTR)IDC_EDT_NICK,
@@ -1098,7 +1219,7 @@ static void LayoutForScreen(HWND hwnd)
             if (g_nick[0]) SetWindowTextW(g_editNick, g_nick);
             mkbtn(hwnd, B_CHOOSE, IDC_BTN_CHOOSE, 220, 348, 200, 36);
             mkbtn(hwnd, B_BACK,   IDC_BTN_BACK,   220, 392, 200, 30);
-            break; }
+            break;
         case SCR_LORE:
             mkbtn(hwnd, B_BACK, IDC_BTN_BACK, 220, 420, 200, 34);
             break;
@@ -1109,6 +1230,9 @@ static void LayoutForScreen(HWND hwnd)
             break;
         case SCR_WORLD:
             break;
+        case SCR_PROF:
+            for (i = 0; i < 3; i++) mkbtn(hwnd, L"", IDC_BTN_P0 + i, 12 + i * 208, 52, 200, 300);
+            break;
     }
     InvalidateRect(hwnd, NULL, TRUE);
 }
@@ -1116,6 +1240,7 @@ static void LayoutForScreen(HWND hwnd)
 /* ----------------------------- Interaction -------------------------------- */
 static void EnterWorld(HWND hwnd)
 {
+    InitItems();
     BuildAbilities(); /* class-dependent hotbar */
     g_screen = SCR_WORLD;
     SetTimer(hwnd, 2, 50, NULL);   /* mouse-walk / regen tick */
@@ -1516,6 +1641,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 case IDC_BTN_CHOOSE:txt = B_CHOOSE;bg = RGB(0x3A,0x6B,0x3F); break;
                 case IDC_BTN_CONT:  txt = B_CONT;  bg = RGB(0x3A,0x6B,0x3F); break;
                 case IDC_BTN_NEW:   txt = B_NEW;   break;
+                case IDC_BTN_P0: case IDC_BTN_P1: case IDC_BTN_P2: {
+                    RECT r = di->rcItem;
+                    HBRUSH b = CreateSolidBrush(di->itemState & ODS_SELECTED ? RGB(0x2A,0x34,0x50) : RGB(0x1A,0x1E,0x2C));
+                    FillRect(di->hDC, &r, b); DeleteObject(b);
+                    return TRUE; }
                 case IDC_CARD_0: case IDC_CARD_1: case IDC_CARD_2: {
                     int idx = di->CtlID - IDC_CARD_0;
                     RECT r = di->rcItem;
@@ -1549,6 +1679,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             OnPaint(hwnd);
             return 0;
         case WM_KEYDOWN:
+            if (g_screen == SCR_PROF) {
+                switch (wp) {
+                    case '1': ChooseProfession(hwnd, 0); break;
+                    case '2': ChooseProfession(hwnd, 1); break;
+                    case '3': ChooseProfession(hwnd, 2); break;
+                }
+                return 0;
+            }
             if (g_screen != SCR_WORLD) return 0;
             switch (wp) {
                 case '1': CastAbility(hwnd, 0); break;
@@ -1559,17 +1697,43 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 case VK_RIGHT: case 'D': MovePlayer(hwnd,  8, 0); break;
                 case VK_UP:    case 'W': MovePlayer(hwnd, 0, -8); break;
                 case VK_DOWN:  case 'S': MovePlayer(hwnd, 0,  8); break;
+                case VK_TAB:
+                    g_invOpen = !g_invOpen;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    break;
                 case 'E': {
-                    int dx = g_px - CAT_X, dy = g_py - CAT_Y;
-                    if (sqrt((double)(dx*dx+dy*dy)) < TALK_R) TalkCat(hwnd);
-                    else TryPickAcorn(hwnd);
+                    UpdateFocus();
+                    if (g_focusKind == 1) {
+                        if (g_focusId == 0) TalkCat(hwnd);
+                        else if (g_focusId == 1) TalkSmith(hwnd);
+                        else TalkMarya(hwnd);
+                    } else if (g_focusKind == 2) {
+                        TryPickAcorn(hwnd);
+                    } else if (g_focusKind == 3 && g_focusId == 0) {
+                        TryPickAcorn(hwnd);   /* reach under the oak crown */
+                    }
+                    InvalidateRect(hwnd, NULL, FALSE);
                     break; }
                 case VK_ESCAPE:
+                    if (g_dialogShown) { g_dialogShown = 0; InvalidateRect(hwnd, NULL, FALSE); break; }
+                    if (g_invOpen)     { g_invOpen = 0;     InvalidateRect(hwnd, NULL, FALSE); break; }
                     KillTimer(hwnd, 2);
                     g_walkDestSet = 0;
                     g_screen = SCR_CONTINUE; /* back to menu keeps profile */
                     LayoutForScreen(hwnd);
                     break;
+            }
+            return 0;
+        case WM_LBUTTONDBLCLK:
+            if (g_screen == SCR_WORLD && g_invOpen) {
+                int mx = GET_X_LPARAM(lp), my = GET_Y_LPARAM(lp), i;
+                for (i = 0; i < g_invGridN; i++) {
+                    RECT r = g_invRects[i];
+                    if (mx >= r.left && mx < r.right && my >= r.top && my < r.bottom) {
+                        InvSlotAction(hwnd, i);
+                        break;
+                    }
+                }
             }
             return 0;
         case WM_LBUTTONDOWN:

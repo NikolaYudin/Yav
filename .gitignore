@@ -1,2 +1,6 @@
-# Compiled/Binary files
-*.exe
+# Служебное
+*.log
+
+# Артефакты сборки прототипа (бинарники не храним — только zip в build_archives)
+Prototype/YavLaunch.exe
+YavLaunch_profile.json

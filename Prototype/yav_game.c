@@ -835,9 +835,12 @@ static void CamBegin(HDC hdc)
     xt.eM11 = 1.f; xt.eM22 = 1.f; xt.eM12 = 0.f; xt.eM21 = 0.f;
     xt.eDx = (FLOAT)-g_camX; xt.eDy = (FLOAT)-g_camY;
     SetWorldTransform(hdc, &xt);
-    /* remember any existing clip, then restrict to the view rect */
+    /* v0.20 FIX: IntersectClipRect is applied in CURRENT world space, so it
+       must receive WORLD coords of the visible window rect — not screen
+       coords. Passing (0..WIN_W, VIEW_TOP..WIN_H) clipped the village out of
+       existence whenever the camera moved ("карта обрезана"). */
     if (GetClipRgn(hdc, keep) == 1) { } /* keep holds prior region */
-    IntersectClipRect(hdc, 0, VIEW_TOP, WIN_W, WIN_H);
+    IntersectClipRect(hdc, g_camX, g_camY + VIEW_TOP, g_camX + WIN_W, g_camY + WIN_H);
     DeleteObject(keep);
 }
 static void CamEnd(HDC hdc)
@@ -1781,13 +1784,18 @@ static void PaintWorld(HDC hdc)
     TextC(hdc, OAK_X, OAK_Y + 62, T_OAK, RGB(0xC8,0xC8,0xD8), g_fSmall, 1);
     /* dark grove spot (v0.7: shows remaining loot) */
     PaintGroveSpot(hdc);
-    /* v0.17: movement grid over the WHOLE world (not just one screenful) */
+    /* v0.17/v0.20 FIX: movement grid. We are INSIDE CamBegin here, so all
+       coordinates must be WORLD coords. The old code passed VIEW_TOP/WIN_H
+       (screen values) as world y — the horizontal lines landed ~672 px above
+       the visible area ("карта обрезана, сетка не совпадает"). Now the grid
+       spans exactly the visible world rect [cam .. cam+WIN] x [VIEW_TOP+camY ..]. */
     if (g_screen == SCR_WORLD) {
-        int gx0 = ((g_camX) / 32) * 32, gy0 = ((g_camY) / 32) * 32;
+        int wx0 = ((g_camX) / 32) * 32, wy0 = ((g_camY + VIEW_TOP) / 32) * 32;
+        int wx1 = g_camX + WIN_W, wy1 = g_camY + WIN_H;
         HPEN gp = CreatePen(PS_DOT, 1, RGB(0x2E,0x4A,0x38));
         { HPEN o=(HPEN)SelectObject(hdc,gp); SelectObject(hdc,GetStockObject(NULL_BRUSH));
-          for (i = gx0; i <= g_camX + WIN_W; i += 32) { MoveToEx(hdc,i,VIEW_TOP,NULL); LineTo(hdc,i,WIN_H); }
-          for (i = gy0; i <= g_camY + WIN_H; i += 32) { MoveToEx(hdc,g_camX,i,NULL); LineTo(hdc,g_camX+WIN_W,i); }
+          for (i = wx0; i <= wx1; i += 32) { MoveToEx(hdc,i,g_camY + VIEW_TOP,NULL); LineTo(hdc,i,wy1); }
+          for (i = wy0; i <= wy1; i += 32) { MoveToEx(hdc,wx0,i,NULL); LineTo(hdc,wx1,i); }
           SelectObject(hdc,o);} DeleteObject(gp);
     }
     /* v0.17: L-shaped trajectory preview — two straight legs with a corner */
@@ -1826,13 +1834,15 @@ static void PaintWorld(HDC hdc)
        coords — the extra +OFF_* here doubled the offset and drew the ring on
        top of a pine tree far from the NPC, part of "объекты разбежались") */
     if (g_focusKind == 1) {
+        /* v0.20: raw GDI Ellipse here used the OLD bounding-box convention;
+           our FillEllipse helper uses centre+radius like everything else. */
         int fx = (g_focusId == 0 ? CAT_X : g_focusId == 1 ? SMITH_X : MARYA_X);
         int fy = (g_focusId == 0 ? CAT_Y : g_focusId == 1 ? SMITH_Y + 30 : MARYA_Y + 30);
         HPEN fp = CreatePen(PS_SOLID, 2, RGB(0xFF,0xE9,0x7A));
         HPEN fo = (HPEN)SelectObject(hdc, fp);
-        SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        HBRUSH fb = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
         Ellipse(hdc, fx - 26, fy - 24, fx + 26, fy + 24);
-        SelectObject(hdc, fo); DeleteObject(fp);
+        SelectObject(hdc, fo); SelectObject(hdc, fb); DeleteObject(fp);
     }
     /* v0.19: the old "hint above player" block drew its text in WORLD coords
        while the camera transform was already reset — with a panned camera the
@@ -2520,7 +2530,12 @@ static void MovePlayer(HWND hwnd, int dx, int dy)
    v0.17: diagonal orders turn into an L-shaped path of right-angle legs —
    the hero moves only along straight horizontal/vertical segments, taking
    the shortest leg order (dominant axis first). Waypoint g_wpx/g_wpy is the
-   corner; after reaching it the hero turns toward the final point. */
+   corner; after reaching it the hero turns toward the final point.
+   v0.20 FIX: the corner waypoint must be reached EXACTLY before turning.
+   The old code snapped movement to one axis and could stop at (wpx, wpy-3)
+   — close enough for "reached", but then the second leg was never walked:
+   the hero stopped mid-path and looked like it "went somewhere else". Now
+   we snap onto the corner coordinate when we are within a step of it. */
 static void WalkToward(HWND hwnd)
 {
     double dx, dy, d;
@@ -2533,17 +2548,23 @@ static void WalkToward(HWND hwnd)
     if (fabs(dx) >= fabs(dy)) dy = 0; else dx = 0;      /* snap to one axis */
     d = sqrt(dx * dx + dy * dy);
     if (d < WALK_SPEED) {
+        /* land exactly on the waypoint (corner or final point) */
         g_px += (int)dx; g_py += (int)dy;
-        if (g_wpActive && (g_px != g_walkX || g_py != g_walkY)) {
-            /* reached the corner: now head to the final point */
+        if (g_wpActive) {
+            /* reached the corner precisely — now head to the final point */
+            g_px = g_wpx; g_py = g_wpy;
             g_wpActive = 0;
         } else {
+            g_px = g_walkX; g_py = g_walkY;             /* arrived at target */
             g_walkDestSet = 0; g_wpActive = 0;
         }
     }
     else {
         int nx = g_px + (int)(dx / d * WALK_SPEED);
         int ny = g_py + (int)(dy / d * WALK_SPEED);
+        /* don't overshoot the axis-aligned target */
+        if (dy == 0) { if (dx > 0 && nx > tx) nx = tx; if (dx < 0 && nx < tx) nx = tx; }
+        if (dx == 0) { if (dy > 0 && ny > ty) ny = ty; if (dy < 0 && ny < ty) ny = ty; }
         if (BlockedAt(nx, ny)) { g_walkDestSet = 0; g_wpActive = 0; } /* obstacle: stop */
         else { g_px = nx; g_py = ny; }
     }
@@ -2800,9 +2821,9 @@ static LONG WINAPI TopLevelFilter(EXCEPTION_POINTERS* ep)
     h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
         SetFilePointer(h, 0, NULL, FILE_END);   /* append: keep the whole history */
-        /* build "YAV prototype v0.18: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
+        /* build "YAV prototype v0.20: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
            using only string APIs — no msvcrt printf anywhere in this path */
-        lstrcpyW(line, L"YAV prototype v0.18: exception 0x");
+        lstrcpyW(line, L"YAV prototype v0.20: exception 0x");
         WcAppendHex(line, code, 8);
         lstrcatW(line, L" at 0x");
         WcAppendHex(line, addr, 16);
@@ -2834,14 +2855,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_CREATE: {
             int i;
             HINSTANCE hi = ((LPCREATESTRUCT)lp)->hInstance;
-            g_fTitle = CreateFontW(64, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
-                                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FF_DONTCARE, L"Segoe UI");
-            g_fBig   = CreateFontW(28, 0, 0, 0, FW_BOLD, 0, 0, 0, DEFAULT_CHARSET,
-                                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FF_DONTCARE, L"Segoe UI");
-            g_fMed   = CreateFontW(18, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FF_DONTCARE, L"Segoe UI");
-            g_fSmall = CreateFontW(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, DEFAULT_CHARSET,
-                                  OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FF_DONTCARE, L"Segoe UI");
+            g_fTitle = CreateFontW(64, 0, 0, 0, FW_BOLD, 0, 0, 0, EASTEUROPE_CHARSET,
+                                  OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FF_DONTCARE, L"Segoe UI");
+            g_fBig   = CreateFontW(28, 0, 0, 0, FW_BOLD, 0, 0, 0, EASTEUROPE_CHARSET,
+                                  OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FF_DONTCARE, L"Segoe UI");
+            g_fMed   = CreateFontW(18, 0, 0, 0, FW_NORMAL, 0, 0, 0, EASTEUROPE_CHARSET,
+                                  OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FF_DONTCARE, L"Segoe UI");
+            g_fSmall = CreateFontW(14, 0, 0, 0, FW_NORMAL, 0, 0, 0, EASTEUROPE_CHARSET,
+                                  OUT_TT_PRECIS, CLIP_DEFAULT_PRECIS, ANTIALIASED_QUALITY, FF_DONTCARE, L"Segoe UI");
             for (i = 0; i < 4; i++) { HFONT f = i==0?g_fTitle:i==1?g_fBig:i==2?g_fMed:g_fSmall; (void)f; }
             (void)hi;
             hasProfile = LoadProfile();
@@ -3019,6 +3040,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         if (hit >= 0) { TryPickAcorn(hwnd); return 0; }
                     }
                     if (mx >= 14 && mx <= WIN_W - 14 && my >= 96 && my <= WIN_H - 40) {
+                        /* v0.20 FIX: the click is a SCREEN coordinate — it must
+                           be converted to WORLD space by adding the camera
+                           offset. Previously the raw screen value was used as
+                           world position, so with any panned camera the hero
+                           walked somewhere else ("игрок идёт не туда"). */
+                        mx += g_camX; my += g_camY;
                         /* v0.17: diagonal orders become an L-shaped path of
                            right-angle legs (dominant axis first = shortest). */
                         int tx = mx, ty = my;            /* final target (world) */

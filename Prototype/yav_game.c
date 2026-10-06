@@ -138,6 +138,25 @@ static void PaintMinimap(HDC hdc);
 static void DrawItemIcon(HDC hdc, RECT ir, int id, COLORREF base);
 static void PaintLaunch(HWND hwnd, HDC hdc);
 static void PaintSelect(HWND hwnd, HDC hdc);
+/* v0.27 forward decls: primitives used by the early UI painters (they are
+   defined further down; without these the file did not compile). */
+static void TextL(HDC hdc, int x, int y, const wchar_t* s, COLORREF c, HFONT f);
+static void TextR(HDC hdc, int x, int y, const wchar_t* s, COLORREF c, HFONT f);
+static void FillEllipse(HDC hdc, int cx, int cy, int rx, int ry, COLORREF c);
+static void DrawItemIcon(HDC hdc, RECT ir, int id, COLORREF base);
+static void PaintPlayerPanel(HDC hdc);
+static void PaintMinimap(HDC hdc);
+static void PaintFocusInfo(HDC hdc);
+static void PaintAbilityBar(HDC hdc);
+static void PaintInventory(HDC hdc);
+static void PaintCharWindow(HWND hwnd, HDC hdc);
+static void PaintDialogBox(HDC hdc);
+static void PaintToast(HDC hdc);
+static void PaintInvTooltip(HDC hdc);
+static void PaintMenuButton(HDC hdc);
+/* NetDrawPeers already declared non-static above (line ~135). */
+static void CamBegin(HDC hdc);
+static void CamEnd(HDC hdc);
 static void ShowDialogTop(const wchar_t* text, ...);   /* v0.16: variadic-safe setter: formats %ls/%d templates from varargs, copies plain strings as-is */
 static void TalkSmith(HWND hwnd);
 static void TalkMarya(HWND hwnd);

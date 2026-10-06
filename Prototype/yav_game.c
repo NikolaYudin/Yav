@@ -264,6 +264,10 @@ typedef struct { int id, count; } Slot;
 static Slot  g_inv[INV_CAP];
 static int   g_equipW = 0, g_equipA = 0, g_equipR = 0;   /* item ids or 0 */
 static int   g_invOpen = 0;
+/* v0.24: character sheet (TAB) per the UI prompt + single bottom strip */
+static int   g_charOpen = 0;
+static RECT  g_charRects[12];
+static int   g_charGridN = 0;
 static int   g_level = 1, g_profBonus = 0;              /* profession bonus */
 static int   g_prof = -1;                               /* v0.19: 0 Воин / 1 Лучник / 2 Волхв, -1 ещё не избрана */
 static int   g_youngster = 1;                           /* 1 = молодец, 0 = истый герой */
@@ -1733,6 +1737,9 @@ static void DrawItemIcon(HDC hdc, RECT ir, int id, COLORREF base)
     }
 }
 
+static int CharEquipIdForSlot(int i);
+static const wchar_t* CharSlotName(int i);
+
 /* v0.16: hover tooltip over an inventory slot — name + hint what it does */
 static void PaintInvTooltip(HDC hdc)
 {
@@ -1740,10 +1747,27 @@ static void PaintInvTooltip(HDC hdc)
     const wchar_t* tip = NULL;
     wchar_t line[96];
     RECT tr; HBRUSH br; SIZE sz; HPEN pen;
-    if (!g_invOpen || g_mouseX < 0) return;
+    if (!(g_invOpen || g_charOpen) || g_mouseX < 0) return;
     for (i = 0; i < g_invGridN; i++) {
         RECT r = g_invRects[i];
         if (g_mouseX >= r.left && g_mouseX < r.right && g_mouseY >= r.top && g_mouseY < r.bottom) { idx = i; break; }
+    }
+    /* v0.24: hovering a cell of the character sheet shows its tip as well */
+    if (idx < 0 && g_charOpen) {
+        static wchar_t cb[96];
+        for (i = 0; i < g_charGridN; i++) {
+            RECT r = g_charRects[i];
+            if (r.right > r.left && g_mouseX >= r.left && g_mouseX < r.right &&
+                g_mouseY >= r.top && g_mouseY < r.bottom) { idx = i; break; }
+        }
+        if (idx >= 0) {
+            const wchar_t* nm = CharSlotName(idx);
+            int eid = CharEquipIdForSlot(idx);
+            if (eid) SafeWfmt(cb, 96, L"%ls \x2014 %ls (\x043d\x0430\x0434\x0435\x0442\x043e)", nm, Item(eid)->name);
+            else     SafeWfmt(cb, 96, L"%ls \x2014 \x043f\x0443\x0441\x0442\x043e", nm);
+            tip = cb;
+            goto draw_tip;
+        }
     }
     if (idx < 0 || !g_inv[idx].id) return;
     {
@@ -1757,6 +1781,7 @@ static void PaintInvTooltip(HDC hdc)
         else if (d->id == ITEM_AMULET) SafeWfmt(line, 96, L"%ls — оберег, клик: надеть/снять", d->name), tip = line;
         else tip = d->name;
     }
+draw_tip:
     SelectObject(hdc, g_fSmall);
     GetTextExtentPoint32W(hdc, tip, (int)wcslen(tip), &sz);
     tr.left = g_mouseX + 12; tr.top = g_mouseY + 14;
@@ -1769,6 +1794,178 @@ static void PaintInvTooltip(HDC hdc)
     { HPEN o=(HPEN)SelectObject(hdc,pen); SelectObject(hdc,GetStockObject(NULL_BRUSH));
       Rectangle(hdc,tr.left,tr.top,tr.right,tr.bottom); SelectObject(hdc,o);} DeleteObject(pen);
     TextL(hdc, tr.left + 7, tr.top + 4, tip, RGB(0xFF,0xF3,0xC0), g_fSmall);
+}
+
+/* ==================== v0.24: character sheet (TAB) ========================
+   Follows the UI prompt: dimmed world behind, centered window, portrait
+   header (avatar + big name + class under it + framed weapon icon at the
+   right), HP/mana stat rows with heart/drop icons, a 3x4 equipment grid and
+   a vertical 7-row resource panel on the right. Dark brown-grey background,
+   gold/bronze frames. */
+static const wchar_t* CharSlotName(int i)
+{
+    static const wchar_t* n[12] = {
+        L"\x0428\x043b\x0435\x043c",                                  /* Шлем */
+        L"\x041d\x0430\x0433\x0440\x0443\x0434\x043d\x0438\x043a",      /* Нагрудник */
+        L"\x041e\x0431\x0435\x0440\x0435\x0433",                          /* Оберег */
+        L"\x041e\x0440\x0443\x0436\x0438\x0435",                          /* Оружие */
+        L"\x0411\x0440\x043e\x043d\x044f",                                /* Броня */
+        L"\x0429\x0438\x0442",                                            /* Щит */
+        L"\x041f\x0435\x0440\x0447\x0430\x0442\x043a\x0438",              /* Перчатки */
+        L"\x0411\x0440\x0430\x0441\x043b\x0435\x0442",                    /* Браслет */
+        L"\x041a\x043e\x043b\x044c\x0446\x043e 1",                       /* Кольцо 1 */
+        L"\x0421\x0430\x043f\x043e\x0433\x0438",                          /* Сапоги */
+        L"\x041a\x043e\x043b\x044c\x0446\x043e 2",                       /* Кольцо 2 */
+        L"\x041f\x0443\x0441\x0442\x043e"                                  /* Пусто */
+    };
+    return (i>=0&&i<12)? n[i] : L"";
+}
+static int CharEquipIdForSlot(int i)
+{
+    switch (i) {
+        case 1:  return g_equipA;   /* нагрудник/одеяние */
+        case 2:  return g_equipR;   /* оберег */
+        case 3:  return g_equipW;   /* оружие */
+        default: return 0;          /* слоты под будущий лут */
+    }
+}
+static void FillTri(HDC hdc, int x1,int y1,int x2,int y2,int x3,int y3)
+{
+    POINT pts[3] = { {x1,y1}, {x2,y2}, {x3,y3} };
+    HPEN o = (HPEN)SelectObject(hdc, (HPEN)GetStockObject(NULL_PEN));
+    Polygon(hdc, pts, 3);
+    SelectObject(hdc, o);
+}
+static void DrawHeartIcon(HDC hdc, int cx, int cy, COLORREF c)
+{
+    HBRUSH br = CreateSolidBrush(c);
+    HPEN o = (HPEN)SelectObject(hdc, (HPEN)GetStockObject(NULL_PEN));
+    HBRUSH ob = (HBRUSH)SelectObject(hdc, br);
+    Ellipse(hdc, cx-6, cy-5, cx, cy+1);
+    Ellipse(hdc, cx, cy-5, cx+6, cy+1);
+    FillTri(hdc, cx-6, cy-1, cx+6, cy-1, cx, cy+7);
+    SelectObject(hdc, ob); SelectObject(hdc, o);
+    DeleteObject(br);
+}
+static void DrawDropIcon(HDC hdc, int cx, int cy, COLORREF c)
+{
+    HBRUSH br = CreateSolidBrush(c);
+    HPEN o = (HPEN)SelectObject(hdc, (HPEN)GetStockObject(NULL_PEN));
+    HBRUSH ob = (HBRUSH)SelectObject(hdc, br);
+    Ellipse(hdc, cx-5, cy-2, cx+5, cy+8);
+    FillTri(hdc, cx-4, cy+1, cx+4, cy+1, cx, cy-8);
+    SelectObject(hdc, ob); SelectObject(hdc, o);
+    DeleteObject(br);
+}
+static void PaintCharWindow(HWND hwnd, HDC hdc)
+{
+    int wx = WIN_W/2 - 300, wy = WIN_H/2 - 232, ww = 600, wh = 464;
+    RECT win = { wx, wy, wx + ww, wy + wh };
+    HBRUSH br; int i; wchar_t b[96];
+    const wchar_t* pname[3];
+    if (!g_charOpen) return;
+    (void)hwnd;
+    /* dim the world behind the sheet */
+    { RECT full = { 0, 0, WIN_W, WIN_H };
+      HBRUSH dim = CreateSolidBrush(RGB(0x06,0x08,0x0E));
+      HPEN dp = CreatePen(PS_NULL, 0, RGB(0,0,0));
+      HPEN o=(HPEN)SelectObject(hdc,dp); HBRUSH ob=(HBRUSH)SelectObject(hdc,dim);
+      Rectangle(hdc, full.left, full.top, full.right, full.bottom);
+      SelectObject(hdc, ob); SelectObject(hdc, o);
+      DeleteObject(dim); DeleteObject(dp); }
+    /* body: dark grey-brown, double bronze frame */
+    br = CreateSolidBrush(RGB(0x24,0x1E,0x18));
+    FillRect(hdc, &win, br); DeleteObject(br);
+    DrawFrameAt(hdc, win, RGB(0xC8,0x9A,0x3E));
+    { RECT inner = { win.left+3, win.top+3, win.right-3, win.bottom-3 };
+      DrawFrameAt(hdc, inner, RGB(0x6A,0x50,0x28)); }
+    /* --- header: avatar | name + class | framed weapon icon ------------- */
+    { RECT av = { wx + 14, wy + 12, wx + 78, wy + 76 };
+      COLORREF ac[3] = { RGB(0xB0,0x4A,0x3A), RGB(0x3A,0x8A,0x4A), RGB(0x6A,0x4A,0x9A) };
+      br = CreateSolidBrush(ac[(g_prof>=0&&g_prof<3)?g_prof:0]);
+      FillRect(hdc, &av, br); DeleteObject(br);
+      DrawFrameAt(hdc, av, RGB(0xC8,0x9A,0x3E));
+      FillCircle(hdc, (av.left+av.right)/2, av.top + 22, 12, RGB(0xE8,0xC8,0x9A));
+      FillEllipse(hdc, (av.left+av.right)/2, av.top + 50, 16, 14, RGB(0xD8,0xD8,0xE4)); }
+    TextL(hdc, wx + 92, wy + 12, g_nick, RGB(0xFF,0xF3,0xC0), g_fBig);
+    pname[0] = PR_WARRIOR; pname[1] = PR_HUNTER; pname[2] = PR_MAGUS;
+    if (g_youngster || g_prof < 0 || g_prof > 2)
+        TextL(hdc, wx + 92, wy + 46, L"\x041c\x043e\x043b\x043e\x0434\x0435\x0446", RGB(0x9A,0xAA,0xC0), g_fMed);
+    else
+        TextL(hdc, wx + 92, wy + 46, pname[g_prof], RGB(0xC8,0x9A,0x3E), g_fMed);
+    { RECT wi = { wx + ww - 78, wy + 12, wx + ww - 14, wy + 76 };
+      br = CreateSolidBrush(RGB(0x1A,0x16,0x10));
+      FillRect(hdc, &wi, br); DeleteObject(br);
+      DrawFrameAt(hdc, wi, RGB(0xC8,0x9A,0x3E));
+      { RECT ir = { wi.left + 12, wi.top + 12, wi.right - 12, wi.bottom - 12 };
+        int wid = g_equipW ? g_equipW
+                : (g_prof==0?ITEM_BULAVA:g_prof==1?ITEM_LUKO:g_prof==2?ITEM_POSOH:0);
+        if (wid) DrawItemIcon(hdc, ir, wid, Item(wid)->col);
+        else { HPEN p=CreatePen(PS_SOLID,2,RGB(0x50,0x58,0x68)); HPEN o=(HPEN)SelectObject(hdc,p);
+               SelectObject(hdc,GetStockObject(NULL_BRUSH));
+               MoveToEx(hdc,ir.left+4,ir.bottom-4,NULL); LineTo(hdc,ir.right-4,ir.top+4);
+               SelectObject(hdc,o); DeleteObject(p); } } }
+    /* --- stats row: HP / mana fractions + level ------------------------- */
+    DrawHeartIcon(hdc, wx + 100, wy + 100, RGB(0xC8,0x4A,0x4A));
+    SafeWfmt(b, 96, L"HP: %d/%d", g_hpCur, g_hpMax);
+    TextL(hdc, wx + 116, wy + 92, b, RGB(0xF0,0xD0,0xD0), g_fSmall);
+    DrawDropIcon(hdc, wx + 260, wy + 100, RGB(0x4A,0x8A,0xE0));
+    SafeWfmt(b, 96, L"\x041c\x0430\x043d\x0430: %d/%d", g_energyCur, g_energyMax);
+    TextL(hdc, wx + 276, wy + 92, b, RGB(0xC8,0xDC,0xF0), g_fSmall);
+    SafeWfmt(b, 96, L"\x0423\x0440\x043e\x0432\x0435\x043d\x044c: %d", g_level);
+    TextL(hdc, wx + 430, wy + 92, b, RGB(0xE8,0xC8,0x5A), g_fSmall);
+    /* --- equipment grid 3 x 4 ------------------------------------------- */
+    { int gx = wx + 16, gy = wy + 132, cell = 76, gap = 8;
+      TextL(hdc, gx, gy - 18, L"\x042d\x043a\x0438\x043f\x0438\x0440\x043e\x0432\x043a\x0430", RGB(0xC8,0x9A,0x3E), g_fSmall);
+      g_charGridN = 0;
+      for (i = 0; i < 12; i++) {
+          int cx = gx + (i % 3) * (cell + gap);
+          int cy = gy + (i / 3) * (cell + gap);
+          RECT sr = { cx, cy, cx + cell, cy + cell };
+          int eid = CharEquipIdForSlot(i);
+          g_charRects[g_charGridN++] = sr;
+          br = CreateSolidBrush(eid ? RGB(0x2E,0x28,0x1E) : RGB(0x14,0x12,0x10));
+          FillRect(hdc, &sr, br); DeleteObject(br);
+          DrawFrameAt(hdc, sr, eid ? RGB(0xC8,0x9A,0x3E) : RGB(0x4A,0x40,0x34));
+          if (eid) {
+              RECT ir = { sr.left + 16, sr.top + 8, sr.right - 16, sr.bottom - 26 };
+              DrawItemIcon(hdc, ir, eid, Item(eid)->col);
+          }
+          TextC(hdc, (sr.left+sr.right)/2, sr.bottom - 20, CharSlotName(i),
+                eid ? RGB(0xFF,0xF3,0xC0) : RGB(0x6A,0x62,0x58), g_fSmall, 1);
+      }
+    }
+    /* --- right column: resources/currency, 7 rows ----------------------- */
+    { int rx = wx + 264, ry = wy + 132;
+      struct { int id; const wchar_t* nm; int cnt; COLORREF col; } res[7];
+      res[0].id = 0;           res[0].nm = L"\x0413\x0440\x043e\x0448\x0438"; res[0].cnt = g_groshi;             res[0].col = RGB(0xE0,0xB0,0x40);
+      res[1].id = ITEM_METAL;  res[1].nm = IT_METAL;  res[1].cnt = InvCount(ITEM_METAL);  res[1].col = RGB(0x8A,0x8A,0x94);
+      res[2].id = ITEM_CLOTH;  res[2].nm = IT_CLOTH;  res[2].cnt = InvCount(ITEM_CLOTH);  res[2].col = RGB(0xE8,0xE0,0xC8);
+      res[3].id = ITEM_ACORN;  res[3].nm = IT_ACORN;  res[3].cnt = InvCount(ITEM_ACORN);  res[3].col = RGB(0xC8,0x8A,0x3E);
+      res[4].id = ITEM_POTION; res[4].nm = IT_POTION; res[4].cnt = InvCount(ITEM_POTION); res[4].col = RGB(0x4A,0xA0,0x60);
+      res[5].id = ITEM_POT_EN; res[5].nm = L"\x0417\x0435\x043b\x044c\x0435 \x0441\x0438\x043b\x044b"; res[5].cnt = InvCount(ITEM_POT_EN); res[5].col = RGB(0x4A,0x8A,0xE0);
+      res[6].id = ITEM_AMULET; res[6].nm = IT_AMULET; res[6].cnt = InvCount(ITEM_AMULET); res[6].col = RGB(0xE0,0xB0,0x40);
+      TextL(hdc, rx, ry - 18, L"\x0420\x0435\x0441\x0443\x0440\x0441\x044b", RGB(0xC8,0x9A,0x3E), g_fSmall);
+      for (i = 0; i < 7; i++) {
+          RECT rr = { rx, ry + i * 44, rx + 320, ry + i * 44 + 40 };
+          br = CreateSolidBrush(RGB(0x18,0x14,0x10));
+          FillRect(hdc, &rr, br); DeleteObject(br);
+          DrawFrameAt(hdc, rr, RGB(0x6A,0x50,0x28));
+          { RECT ir = { rr.left + 4, rr.top + 4, rr.left + 36, rr.bottom - 4 };
+            if (res[i].id == 0) {
+                FillCircle(hdc, (ir.left+ir.right)/2, (ir.top+ir.bottom)/2, 12, res[i].col);
+                FillCircle(hdc, (ir.left+ir.right)/2, (ir.top+ir.bottom)/2, 6, RGB(0xB0,0x80,0x20));
+            } else DrawItemIcon(hdc, ir, res[i].id, res[i].col); }
+          TextL(hdc, rr.left + 44, rr.top + 6, res[i].nm, RGB(0xD8,0xD0,0xC0), g_fSmall);
+          SafeWfmt(b, 96, L"x%d", res[i].cnt);
+          TextR(hdc, rr.right - 8, rr.top + 6, b,
+                res[i].cnt ? RGB(0xFF,0xF3,0xC0) : RGB(0x6A,0x62,0x58), g_fSmall);
+      }
+    }
+    /* footer hint inside the sheet */
+    TextC(hdc, wx + ww/2, wy + wh - 22,
+          L"TAB / ESC \x2014 \x0437\x0430\x043a\x0440\x044b\x0442\x044c | B \x2014 \x0441\x0443\x043c\x043a\x0430 | \x043a\x043b\x0438\x043a \x043f\x043e \x043d\x0430\x0434\x0435\x0442\x043e\x043c\x0443 \x2014 \x0441\x043d\x044f\x0442\x044c",
+          RGB(0x9A,0x8A,0x6A), g_fSmall, 1);
 }
 
 static void PaintInventory(HDC hdc)
@@ -2294,6 +2491,7 @@ static void PaintWorld(HDC hdc)
     PaintFocusInfo(hdc);
     PaintAbilityBar(hdc);
     PaintInventory(hdc);
+    PaintCharWindow(NULL, hdc);   /* v0.24: TAB character sheet */
     PaintDialogBox(hdc);
     PaintToast(hdc);
     PaintInvTooltip(hdc);   /* v0.16: item hint on hover (drawn last, above all) */
@@ -2313,8 +2511,16 @@ static void PaintWorld(HDC hdc)
         SafeWfmt(b, 160, L"%ls %ls", Q_TITLE, qtxt);
         TextC(hdc, WIN_W/2, 46, b, RGB(0x9A,0xE0,0x9A), g_fSmall, 1);
     }
-    /* bottom hint */
-    TextC(hdc, WIN_W/2, WIN_H - 20, W_HINT, RGB(0x7A,0x86,0x9A), g_fSmall, 1);
+    /* v0.24: one solid bottom strip replaces the old floating legend line */
+    {
+        RECT bar = { 0, WIN_H - 26, WIN_W, WIN_H };
+        HBRUSH bb = CreateSolidBrush(RGB(0x0B,0x0E,0x16));
+        FillRect(hdc, &bar, bb); DeleteObject(bb);
+        HPEN bp = CreatePen(PS_SOLID, 1, RGB(0xC8,0x9A,0x3E));
+        { HPEN o=(HPEN)SelectObject(hdc,bp); MoveToEx(hdc,0,WIN_H-26,NULL);
+          LineTo(hdc,WIN_W,WIN_H-26); SelectObject(hdc,o);} DeleteObject(bp);
+        TextC(hdc, WIN_W/2, WIN_H - 19, W_HINT, RGB(0x9A,0xAA,0xC0), g_fSmall, 1);
+    }
     (void)r;
 }
 
@@ -3261,9 +3467,9 @@ static LONG WINAPI TopLevelFilter(EXCEPTION_POINTERS* ep)
     h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
         SetFilePointer(h, 0, NULL, FILE_END);   /* append: keep the whole history */
-        /* build "YAV prototype v0.23: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
+        /* build "YAV prototype v0.24: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
            using only string APIs — no msvcrt printf anywhere in this path */
-        lstrcpyW(line, L"YAV prototype v0.23: exception 0x");
+        lstrcpyW(line, L"YAV prototype v0.24: exception 0x");
         WcAppendHex(line, code, 8);
         lstrcatW(line, L" at 0x");
         WcAppendHex(line, addr, 16);
@@ -3449,7 +3655,14 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 case VK_UP:    case 'W': MovePlayer(hwnd, 0, -8); break;
                 case VK_DOWN:  case 'S': MovePlayer(hwnd, 0,  8); break;
                 case VK_TAB:
+                    /* v0.24: TAB opens the character sheet; B — quick bag */
+                    g_charOpen = !g_charOpen;
+                    if (g_charOpen) g_invOpen = 0;
+                    InvalidateRect(hwnd, NULL, FALSE);
+                    break;
+                case 'B':
                     g_invOpen = !g_invOpen;
+                    if (g_invOpen) g_charOpen = 0;
                     InvalidateRect(hwnd, NULL, FALSE);
                     break;
                 case 'E': {
@@ -3468,6 +3681,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     break; }
                 case VK_ESCAPE:
                     if (g_dialogShown) { g_dialogShown = 0; InvalidateRect(hwnd, NULL, FALSE); break; }
+                    if (g_charOpen)    { g_charOpen = 0;    InvalidateRect(hwnd, NULL, FALSE); break; }
                     if (g_invOpen)     { g_invOpen = 0;     InvalidateRect(hwnd, NULL, FALSE); break; }
                     KillTimer(hwnd, 2);
                     g_walkDestSet = 0;
@@ -3528,6 +3742,20 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                         CastAbility(hwnd, k);
                         return 0;
                     }
+                }
+                /* v0.24: clicking an equipped cell in the sheet unequips it */
+                if (g_charOpen) {
+                    int ci;
+                    for (ci = 0; ci < g_charGridN; ci++) {
+                        RECT cr = g_charRects[ci];
+                        int eid = CharEquipIdForSlot(ci);
+                        if (mx0 >= cr.left && mx0 < cr.right && my0 >= cr.top && my0 < cr.bottom) {
+                            if (eid) ToggleEquip(hwnd, eid);
+                            InvalidateRect(hwnd, NULL, FALSE);
+                            return 0;
+                        }
+                    }
+                    return 0;   /* clicks elsewhere in the sheet are inert */
                 }
                 /* v0.7: single click on an inventory slot equips/drinks too */
                 if (g_invOpen) {

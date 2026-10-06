@@ -150,6 +150,18 @@ static int  InvAdd(int id, int n);
 static int  InvCount(int id);
 static void InvRemove(int id, int n);
 static void SetFocusNpc(int kind, int id, const wchar_t* name);
+
+/* v0.23 FIX: forward declarations for primitives/globals used by the early
+   NpcTalkState() below (they are fully defined later in this file). */
+static void FillCircle(HDC hdc, int cx, int cy, int r, COLORREF c);
+static void FillEllipse(HDC hdc, int cx, int cy, int rx, int ry, COLORREF c);
+#define ITEM_ACORN   1
+#define ITEM_METAL   2
+#define ITEM_CLOTH   3
+#define ITEM_POTION  4                  /* health potion (old enum name kept) */
+#define ITEM_POT_EN  13                 /* energy potion sold in Yaga's shop */
+
+
 static void UpdateFocus(void);
 static void QuestAdvanceCheck(void);
 static void RespawnAcorns(void);
@@ -212,11 +224,20 @@ typedef struct { int x, y, taken; } Acorn;
 static Acorn g_acorns_arr[3] = { {470+OFF_X,290+OFF_Y,0}, {560+OFF_X,306+OFF_Y,0}, {512+OFF_X,336+OFF_Y,0} };
 
 /* ======================= v0.4: items, inventory, NPCs, quests ============ */
-enum { ITEM_ACORN=1, ITEM_METAL, ITEM_CLOTH, ITEM_POTION, ITEM_AMULET,
-       ITEM_BULAVA, ITEM_LUKO, ITEM_POSOH, ITEM_HEAVY, ITEM_LEATHER, ITEM_MANTLE };
+/* v0.23: two potions (health / energy) — old saves store potion==1 => health.
+   ITEM_* are #defined near NpcTalkState() above; kept as macros so the whole
+   file can reference them before this point. */
+#define ITEM_POT_HP   4
+#define ITEM_AMULET   5
+#define ITEM_BULAVA   6
+#define ITEM_LUKO     7
+#define ITEM_POSOH    8
+#define ITEM_HEAVY    9
+#define ITEM_LEATHER  10
+#define ITEM_MANTLE   11
 enum { CAT_W=0, WARRIOR_W=1, HUNTER_W=2, MAGUS_W=3 };   /* weapon classes */
 typedef struct { int id; const wchar_t* name; COLORREF col; int wcls, bonus; } ItemDef;
-static ItemDef g_items[12];
+static ItemDef g_items[14];   /* v0.23: + energy potion slot */
 static void InitItems(void)
 {
     int k = 0;
@@ -232,6 +253,8 @@ static void InitItems(void)
     g_items[k++] = (ItemDef){ ITEM_HEAVY,  IT_HEAVY,  RGB(0x5A,0x6A,0x8A), 0, 10 };
     g_items[k++] = (ItemDef){ ITEM_LEATHER,IT_LEATHER,RGB(0x7A,0x5A,0x3A), 0, 6 };
     g_items[k++] = (ItemDef){ ITEM_MANTLE, IT_MANTLE, RGB(0x7A,0x4A,0x4A), 0, 4 };
+    /* v0.23: energy potion sold in Yaga's shop */
+    g_items[k++] = (ItemDef){ ITEM_POT_EN, L"\x0417\x0435\x043B\x044C\x0435 \x0441\x0438\x043B\x044B", RGB(0x4A,0x8A,0xE0), 0, 0 };
 }
 #define NITEMS (int)(sizeof(g_items)/sizeof(g_items[0]))
 static const ItemDef* Item(int id) { int i; for (i=1;i<NITEMS;i++) if (g_items[i].id==id) return &g_items[i]; return NULL; }
@@ -249,6 +272,45 @@ static int   g_youngster = 1;                           /* 1 = молодец, 0
 #define YOUNG_EN 60
 static int   g_quest = 0;                               /* see quest flow below */
 static int   g_smithStage = 0, g_maryaStage = 0;        /* 0 none,1 got mat,2 crafting,3 done */
+
+/* v0.23: does this NPC currently want to talk? (speech bubble state)
+   2 = wants something NOW (gold bubble), 1 = quest taken/in progress (gray),
+   0 = nothing to do (no bubble). */
+static int NpcTalkState(int id) /* 0 cat, 1 smith, 2 marya, 3 yaga */
+{
+    if (id == 0) {
+        if (g_quest <= 1) return 2;                 /* greeting / acorn hand-in */
+        if (g_quest >= 5) return 2;                 /* offers the profession */
+        return 0;                                   /* tasks in flight elsewhere */
+    }
+    if (id == 1) {
+        if (g_smithStage == 3) return 0;            /* done — gray/none */
+        if (g_smithStage == 2) return 1;            /* forging — waiting */
+        if (g_quest >= 2 && InvCount(ITEM_METAL) > 0) return 2;   /* ready to take ore */
+        if (g_quest >= 2) return 1;                 /* task active but no ore yet */
+        return 0;
+    }
+    if (id == 2) {
+        if (g_maryaStage == 3) return 0;
+        if (g_maryaStage == 2) return 1;
+        if (g_quest >= 2 && InvCount(ITEM_CLOTH) > 0) return 2;
+        if (g_quest >= 2) return 1;
+        return 0;
+    }
+    /* yaga: shop always open */
+    return 2;
+}
+
+/* ================= v0.23: currency "вещие гроши" + Yaga's shop ============ */
+static int   g_groshi = 0;                              /* silver coinage */
+#define YAGA_X (512 + 900)          /* hut east of the village centre */
+#define YAGA_Y (216 + OFF_Y)
+static int   g_yagaAsked = 0;                           /* greeting once per session */
+static int   ShopPriceHp(void)  { return 10; }
+static int   ShopPriceEn(void)  { return 12; }
+static int   ShopBuy(HWND hwnd, int which);             /* 1=hp potion 2=en potion */
+static void  TalkYaga(HWND hwnd);
+static void  DrawShopIcon(HDC hdc, RECT ir, int kind);  /* 0=coin 1=potion 2=sack */
 static ULONGLONG g_smithDoneAt = 0, g_maryaDoneAt = 0;
 static int   g_focusKind = 0, g_focusId = 0;            /* 0 none,1 npc(id=cat/smith/marya idx),2 item,3 object */
 static wchar_t g_focusName[64] = L"";
@@ -314,7 +376,7 @@ enum { AB_NONE = -1, AB_DMG = 0, AB_HEAL, AB_BUFF, AB_PICK };
 /* v0.6: the hotbar has a dedicated resource-pick button (key 4) for everyone,
    so NABILITY grows to 5: [Удар][Спец][Лечение/Бафф][Сбор][Заготовка] */
 #undef NABILITY
-#define NABILITY 5
+#define NABILITY 9   /* v0.23: MMO-style 9-slot hotbar (keys 1..9); free slots are placeholders */
 typedef struct {
     const wchar_t* name;
     wchar_t tag[32];      /* v0.16: fixed buffer — was a pointer; stale/globalalloc'd
@@ -334,7 +396,10 @@ static void BuildAbilities(void)
     int i, dmg = 10;
     /* Hotbar follows the chosen profession; until then the hero is a
        "молодец" (starter) and uses the base set with lower damage. */
-    for (i = 0; i < NABILITY; i++) { memset(&g_ab[i], 0, sizeof(Ability)); }
+    for (i = 0; i < NABILITY; i++) {
+        memset(&g_ab[i], 0, sizeof(Ability));
+        g_ab[i].kind = AB_NONE;   /* v0.23: empty placeholder slot */
+    }
     /* BUGFIX v0.10: hotbar painted the ability NAME with %ls against a wchar_t*
        (pointer value), not the string it points to — reading that bogus address
        raised 0xC0000005 right after entering the world (first WM_PAINT).
@@ -510,12 +575,15 @@ static void InvSlotAction(HWND hwnd, int idx)
 {
     if (idx < 0 || idx >= INV_CAP) return;
     if (!g_inv[idx].id) return;
-    if (g_inv[idx].id == ITEM_POTION) {
-        int r = 30;
-        InvRemove(ITEM_POTION, 1);
-        g_hpCur += r; if (g_hpCur > g_hpMax) g_hpCur = g_hpMax;
-        lstrcpynW(g_speaker, IT_POTION, 64);
-        DialogFmt(D_POTION, NULL, r);   /* v0.10: D_POTION has no placeholders */
+    if (g_inv[idx].id == ITEM_POTION || g_inv[idx].id == ITEM_POT_EN) {
+        int isEn = g_inv[idx].id == ITEM_POT_EN;
+        int r = isEn ? 25 : 30;
+        InvRemove(g_inv[idx].id, 1);
+        if (isEn) { g_energyCur += r; if (g_energyCur > g_energyMax) g_energyCur = g_energyMax; }
+        else      { g_hpCur += r;     if (g_hpCur > g_hpMax)     g_hpCur = g_hpMax; }
+        lstrcpynW(g_speaker, isEn ? L"\x0417\x0435\x043b\x044c\x0435 \x0441\x0438\x043b\x044b" : IT_POTION, 64);
+        if (isEn) { wchar_t d[96]; SafeWfmt(d, 96, L"\x0413\x043b\x043e\x0442\x043e\x043a \x0441\x0438\x043b\x044b \u2014 +%d \x044d\x043d\x0435\x0440\x0433\x0438\x0438!", r); ShowDialogTop(d); }
+        else DialogFmt(D_POTION, NULL, r);   /* v0.10: D_POTION has no placeholders */
         SaveProfile();
         InvalidateRect(hwnd, NULL, FALSE);
         return;
@@ -627,7 +695,8 @@ static void SaveProfile(void)
             "  \"equip\": { \"w\": %d, \"a\": %d, \"r\": %d },\n"
             "  \"inventory\": %s,\n"
             "  \"acornTaken\": [%d, %d, %d],\n"
-            "  \"loot\": [%d, %d]\n"
+            "  \"loot\": [%d, %d],\n"
+            "  \"groshi\": %d\n"
             "}\n",
             stamp, nutf, g_selected, g_hpCur, g_hpMax, g_energyCur,
             g_level, g_profBonus, g_prof, g_youngster, g_px, g_py,
@@ -635,7 +704,7 @@ static void SaveProfile(void)
             g_smithStage, g_maryaStage,
             g_equipW, g_equipA, g_equipR, invJson,
             g_acorns_arr[0].taken, g_acorns_arr[1].taken, g_acorns_arr[2].taken,
-            g_lootMetal, g_lootCloth);
+            g_lootMetal, g_lootCloth, g_groshi);
     }
     fclose(f);
 
@@ -776,6 +845,9 @@ static int LoadProfile(void) /* returns 1 if a valid profile was loaded */
             while (*p == ',' || *p == ' ') p++;
             g_lootCloth = (int)strtol(p, NULL, 10);
           } else { g_lootMetal = 0; g_lootCloth = 0; } }
+        /* v0.23: currency */
+        g_groshi = JsonGetInt(buf, "groshi", 0);
+        if (g_groshi == 0 && !strstr(buf, "\"groshi\"")) g_groshi = 20;  /* starter purse for old saves */
         /* equipment */
         g_equipW = JsonGetInt(buf, "w", 0);
         g_equipA = JsonGetInt(buf, "a", 0);
@@ -802,6 +874,104 @@ static int LoadProfile(void) /* returns 1 if a valid profile was loaded */
     }
     free(buf);
     return ok;
+}
+
+/* ================= v0.23: Yaga's shop (potions for groshi) ================= */
+static void DrawShopIcon(HDC hdc, RECT ir, int kind)
+{
+    int cx = (ir.left + ir.right) / 2, cy = (ir.top + ir.bottom) / 2;
+    int w = ir.right - ir.left, h = ir.bottom - ir.top;
+    HPEN pen; HBRUSH br;
+    if (kind == 0) {                      /* silver coin with a square hole */
+        FillCircle(hdc, cx, cy, (w > h ? h : w) / 2 - 1, RGB(0xD8,0xD8,0xE4));
+        br = CreateSolidBrush(RGB(0x6A,0x6A,0x74));
+        { RECT q = { cx - w/8, cy - w/8, cx + w/8, cy + w/8 }; FillRect(hdc, &q, br); } DeleteObject(br);
+        pen = CreatePen(PS_SOLID, 1, RGB(0x9A,0x9A,0xA8));
+        { HPEN o=(HPEN)SelectObject(hdc,pen); Ellipse(hdc, cx-w/2+2, cy-h/2+2, cx+w/2-2, cy+h/2-2); SelectObject(hdc,o);} DeleteObject(pen);
+    } else if (kind == 1 || kind == 2) {  /* potion flask: red=hp, blue=energy */
+        COLORREF brew = kind == 1 ? RGB(0xC8,0x4A,0x4A) : RGB(0x4A,0x8A,0xE0);
+        pen = CreatePen(PS_SOLID, 2, RGB(0xC8,0xD8,0xE8));
+        br = CreateSolidBrush(brew);
+        { HPEN o=(HPEN)SelectObject(hdc,pen); HBRUSH ob=(HBRUSH)SelectObject(hdc,br);
+          Ellipse(hdc, cx-w/4, cy-h/8, cx+w/4, cy+h/3);
+          Rectangle(hdc, cx-w/12, cy-h/3, cx+w/12, cy-h/8);
+          SelectObject(hdc,ob); SelectObject(hdc,o);} DeleteObject(pen); DeleteObject(br);
+    } else {                              /* sack */
+        br = CreateSolidBrush(RGB(0x8A,0x6A,0x3A));
+        FillEllipse(hdc, cx, cy + h/8, w/2, h/2, RGB(0x8A,0x6A,0x3A));
+        DeleteObject(br);
+    }
+}
+
+static void EarnGroshi(int n, const wchar_t* why)
+{
+    wchar_t t[160];
+    g_groshi += n;
+    SafeWfmt(t, 160, L"+%d \x0433\x0440\x043e\x0448\x0435\x0439 \x00b7 %ls", n, why);
+    Toast(t);
+}
+
+/* v0.23: quest-completion reward — pay the hero AND pop a green banner for
+   exactly 5 seconds (Toast owns its own timer; SaveProfile keeps it in sync). */
+static void QuestDoneReward(int n, const wchar_t* qname)
+{
+    EarnGroshi(n, qname);
+    SaveProfile();               /* real-time autosave on quest completion */
+}
+
+/* v0.23: full quest-complete banner — "Поручение N выполнено! +X грошей".
+   Toast sets its own 5-second timer; this helper is called at the exact
+   moment the quest state advances so the popup always matches reality. */
+static void QuestCompleteToast(int n, int coins, const wchar_t* doneMsg)
+{
+    wchar_t b[192];
+    g_groshi += coins;
+    SafeWfmt(b, 192, L"\x2726 %ls \x00b7 +%d \x0433\x0440\x043e\x0448\x0435\x0439", doneMsg, coins);
+    Toast(b);
+    SaveProfile();
+}
+
+static int ShopBuy(HWND hwnd, int which)   /* 1 hp-potion, 2 energy-potion */
+{
+    int price = which == 1 ? ShopPriceHp() : ShopPriceEn();
+    wchar_t d[160];
+    if (g_groshi < price) {
+        lstrcpynW(g_speaker, L"\x042f\x0433\x0430", 64);
+        SafeWfmt(d, 160, L"\x041c\x0430\x043b\x043e \x0433\x0440\x043e\x0448\x0435\x0439, \x0431\x0430\x0442\x044C! \x041d\x0430\x0434\x043e \x043d\x0430 \x043d\x0438\x0447\x0435\x0433\x043e \x2014 %d \x043d\x0443\x0436\x043d\x043e.", price);
+        ShowDialogTop(d);
+        return 0;
+    }
+    if (!InvAdd(which == 1 ? ITEM_POTION : ITEM_POT_EN, 1)) {
+        lstrcpynW(g_speaker, L"\x042f\x0433\x0430", 64);
+        ShowDialogTop(L"\x0421\x0443\x043c\x043a\x0430 \x043f\x043e\x043b\x043d\x0430 \u2014 \x043d\x0435\x0447\x0435\x0433\x043e \x043f\x043e\x043b\x043e\x0436\x0438\x0442\x044C!");
+        return 0;
+    }
+    g_groshi -= price;
+    lstrcpynW(g_speaker, L"\x042f\x0433\x0430", 64);
+    if (which == 1)
+        SafeWfmt(d, 160, L"\x0417\x0435\x043b\x044C\x0435 \x0431\x043E\x0434\x0440\x044F\x0448\x0435\x0435 \u2014 %d \x0433\x0440\x043e\x0448\x0435\x0439. \x041d\x0430 \x0437\x0434\x043e\x0440\x043E\x0432\x044C\x0435!", price);
+    else
+        SafeWfmt(d, 160, L"\x0417\x0435\x043b\x044C\x0435 \x0441\x0438\x043b\x044B \u2014 %d \x0433\x0440\x043e\x0448\x0435\x0439. \x041f\x043e\x0439 \x043d\x0430 \x0437\x0434\x043e\x0440\x043E\x0432\x044C\x0435!", price);
+    ShowDialogTop(d);
+    SaveProfile();
+    InvalidateRect(hwnd, NULL, FALSE);
+    return 1;
+}
+
+static void TalkYaga(HWND hwnd)
+{
+    wchar_t d[220];
+    ULONGLONG now = GetTickCount64();
+    if (g_dialogShown) { g_dialogShown = 0; InvalidateRect(hwnd, NULL, FALSE); return; }
+    lstrcpynW(g_speaker, L"\x042f\x0433\x0430", 64);
+    SafeWfmt(d, 220,
+        L"\x0425\x0430-\x0445\x0430, \x043c\x043e\x043b\x043e\x0434\x0435\x0446! \x041b\x0430\x0432\x043a\x0430 \x042f\x0433\x0438 \x043e\x0442\x0432\x043e\x0440\x043d\x0430! "
+        L"[1] \x0417\x0435\x043b\x044C\x0435 \x0431\x043E\x0434\x0440\x044F\x0448\x0435\x0435 (+30 \u0416) \u2014 %d \u0433.  "
+        L"[2] \x0417\x0435\x043b\x044C\x0435 \x0441\x0438\x043b\x044B (+25 \u041c) \u2014 %d \u0433.  "
+        L"\x0423 \x0442\x0435\x0431\x044f: %d \u0433.",
+        ShopPriceHp(), ShopPriceEn(), g_groshi);
+    ShowDialogTop(d);
+    (void)now; (void)hwnd;
 }
 
 /* ------------------------------ Rendering -------------------------------- */
@@ -1444,9 +1614,12 @@ static void PaintPlayerPanel(HDC hdc)
     Bar3D(hdc, 18, 56, 224, 14, (double)g_energyCur / (g_energyMax?g_energyMax:1), RGB(0x30,0x60,0xC0));
     SafeWfmt(b, 128, L"\x042d:%d/%d", g_energyCur, g_energyMax);
     TextL(hdc, 22, 56, b, RGB(0xFF,0xFF,0xFF), g_fSmall);
-    /* acorns counter */
+    /* acorns + v0.23 currency */
     SafeWfmt(b, 128, L"\x0416\x0435\x043b\x0443\x0434\x0438: %d/3", g_acorns);
     TextL(hdc, 18, 76, b, RGB(0xC8,0x8A,0x3E), g_fSmall);
+    { RECT cir = { 200, 70, 224, 94 }; DrawShopIcon(hdc, cir, 0); }
+    SafeWfmt(b, 128, L"%d \x0433.", g_groshi);
+    TextL(hdc, 228, 76, b, RGB(0xD8,0xD8,0xE4), g_fSmall);
 }
 
 /* --- Focus info window (top-center) -------------------------------------- */
@@ -1656,9 +1829,41 @@ static void PaintInventory(HDC hdc)
 
 /* --- Ability bar: centered at the bottom ---------------------------------- */
 static RECT g_abRects[NABILITY];   /* v0.6: clickable hotbar buttons */
+/* v0.23: small pixel-art glyph per ability slot so the bar is readable even
+   without art assets: sword, bolt, flask, coin-sack, empty placeholder. */
+static void DrawAbilityGlyph(HDC hdc, RECT r, int slot)
+{
+    int cx = (r.left + r.right)/2, cy = (r.top + r.bottom)/2;
+    HPEN pen; HBRUSH br; HPEN o;
+    if (slot == 0 || slot == 1) {               /* strike / special: sword */
+        pen = CreatePen(PS_SOLID, 3, RGB(0xD8,0xD8,0xE4)); o=(HPEN)SelectObject(hdc,pen);
+        MoveToEx(hdc, cx-8, cy+9, NULL); LineTo(hdc, cx+7, cy-6); SelectObject(hdc,o);
+        pen = CreatePen(PS_SOLID, 3, RGB(0xC8,0x9A,0x3E)); o=(HPEN)SelectObject(hdc,pen);
+        MoveToEx(hdc, cx-10, cy+4, NULL); LineTo(hdc, cx-2, cy+12); SelectObject(hdc,o);
+        DeleteObject(pen);
+    } else if (slot == 2) {                     /* heal / buff: green flask */
+        br = CreateSolidBrush(RGB(0x4A,0xA0,0x60));
+        { HPEN op=(HPEN)SelectObject(hdc,(HPEN)GetStockObject(NULL_PEN));
+          HBRUSH ob=(HBRUSH)SelectObject(hdc,br);
+          Ellipse(hdc, cx-7, cy-3, cx+7, cy+10); Rectangle(hdc, cx-3, cy-10, cx+3, cy-2);
+          SelectObject(hdc,ob); SelectObject(hdc,op);} DeleteObject(br);
+    } else if (slot == 3) {                     /* gather: coin sack */
+        FillEllipse(hdc, cx, cy+3, 9, 8, RGB(0x8A,0x6A,0x3A));
+        pen = CreatePen(PS_SOLID, 2, RGB(0xE8,0xC8,0x5A)); o=(HPEN)SelectObject(hdc,pen);
+        MoveToEx(hdc, cx-4, cy-6, NULL); LineTo(hdc, cx+4, cy-6); SelectObject(hdc,o);
+        DeleteObject(pen);
+        FillCircle(hdc, cx, cy+2, 3, RGB(0xD8,0xD8,0xE4));
+    } else {                                    /* reserved: dim diamond */
+        pen = CreatePen(PS_SOLID, 2, RGB(0x50,0x58,0x68)); o=(HPEN)SelectObject(hdc,pen);
+        SelectObject(hdc, GetStockObject(NULL_BRUSH));
+        MoveToEx(hdc, cx, cy-8, NULL); LineTo(hdc, cx+8, cy); LineTo(hdc, cx, cy+8);
+        LineTo(hdc, cx-8, cy); LineTo(hdc, cx, cy-8); SelectObject(hdc,o);
+        DeleteObject(pen);
+    }
+}
 static void PaintAbilityBar(HDC hdc)
 {
-    int bw = 64, gap = 8, total = NABILITY*bw + (NABILITY-1)*gap;
+    int bw = 52, gap = 6, total = NABILITY*bw + (NABILITY-1)*gap;
     int x = WIN_W/2 - total/2, y = WIN_H - 74;
     int i;
     ULONGLONG now = GetTickCount64();
@@ -1672,14 +1877,18 @@ static void PaintAbilityBar(HDC hdc)
         FillRect(hdc, &r, br); DeleteObject(br);
         DrawFrameAt(hdc, r, RGB(0xC8,0x9A,0x3E));
         SafeWfmt(b, 64, L"%d", i+1);
-        TextL(hdc, r.left + 4, r.top + 2, b, RGB(0xE8,0xC8,0x5A), g_fSmall);
-        if (a->name[0]) {
-            SafeWfmt(b, 64, L"%ls", a->name);
-            TextC(hdc, (r.left+r.right)/2, r.bottom - 18, b, RGB(0xE8,0xD8,0xA8), g_fSmall, 1);
-        }
+        TextL(hdc, r.left + 3, r.top + 1, b, RGB(0xE8,0xC8,0x5A), g_fSmall);
+        /* v0.23: icon glyph in the middle, short tag under it, cooldown count
+           in the bottom-right corner (MMO-style) */
+        DrawAbilityGlyph(hdc, r, i);
         if (a->tag[0]) {
             SafeWfmt(b, 64, L"%ls", a->tag);
-            TextC(hdc, (r.left+r.right)/2, r.top + 22, b, RGB(0xFF,0xFF,0xFF), g_fSmall, 1);
+            TextC(hdc, (r.left+r.right)/2, r.bottom - 14, b, RGB(0xFF,0xFF,0xFF), g_fSmall, 1);
+        }
+        if (a->readyAt > now) {
+            int secs = (int)((a->readyAt - now + 999) / 1000);
+            SafeWfmt(b, 64, L"%d", secs);
+            TextL(hdc, r.right - 14, r.bottom - 15, b, RGB(0xFF,0xE9,0x7A), g_fSmall);
         }
         if (cdLeft > 0.0) {
             HBRUSH dim = CreateSolidBrush(RGB(0x08,0x0A,0x10));
@@ -1694,6 +1903,44 @@ static void PaintAbilityBar(HDC hdc)
             SelectObject(hdc, o); DeleteObject(p);
         }
     }
+}
+
+/* v0.23: MENU button (bottom-right corner of the world screen). Opens a
+   pause panel: Continue / Save & Quit to launch screen. */
+static RECT g_menuRect = { 0, 0, 0, 0 };
+static int  g_menuOpen = 0;
+static RECT g_mContinue, g_mQuit;
+/* v0.23: Yaga's shop panel (clickable buy rows inside the dialog box) */
+static RECT g_shopRects[2];
+static void PaintMenuButton(HDC hdc)
+{
+    int bw = 96, bh = 30;
+    g_menuRect.left = WIN_W - bw - 10; g_menuRect.top = WIN_H - bh - 10;
+    g_menuRect.right = WIN_W - 10;     g_menuRect.bottom = WIN_H - 10;
+    HBRUSH br = CreateSolidBrush(RGB(0x18,0x1C,0x2A));
+    FillRect(hdc, &g_menuRect, br); DeleteObject(br);
+    DrawFrameAt(hdc, g_menuRect, RGB(0xC8,0x9A,0x3E));
+    TextC(hdc, (g_menuRect.left+g_menuRect.right)/2, g_menuRect.top + 6,
+          L"\x041C\x0435\x043D\x044E", RGB(0xE8,0xD8,0xA8), g_fSmall, 1); /* Меню */
+    if (!g_menuOpen) return;
+    /* dim overlay + panel */
+    { HBRUSH d = CreateSolidBrush(RGB(0x06,0x08,0x0E));
+      RECT ov = { 0, 0, WIN_W, WIN_H }; FillRect(hdc, &ov, d); DeleteObject(d); }
+    RECT pr = { WIN_W/2 - 150, WIN_H/2 - 110, WIN_W/2 + 150, WIN_H/2 + 110 };
+    HBRUSH pb = CreateSolidBrush(RGB(0x14,0x18,0x28));
+    FillRect(hdc, &pr, pb); DeleteObject(pb);
+    DrawFrameAt(hdc, pr, RGB(0xE8,0xC8,0x5A));
+    TextC(hdc, WIN_W/2, pr.top + 14, L"\x041C\x0435\x043D\x044E", RGB(0xE8,0xC8,0x5A), g_fMed, 1); /* Меню */
+    g_mContinue = (RECT){ pr.left + 30, pr.top + 56, pr.right - 30, pr.top + 92 };
+    g_mQuit     = (RECT){ pr.left + 30, pr.bottom - 92, pr.right - 30, pr.bottom - 56 };
+    HBRUSH b1 = CreateSolidBrush(RGB(0x1D,0x2A,0x1D)); FillRect(hdc, &g_mContinue, b1); DeleteObject(b1);
+    DrawFrameAt(hdc, g_mContinue, RGB(0x7A,0xC8,0x7A));
+    TextC(hdc, (g_mContinue.left+g_mContinue.right)/2, g_mContinue.top + 6,
+          L"\x041F\x0440\x043E\x0434\x043E\x043B\x0436\x0438\x0442\x044C", RGB(0xD8,0xF0,0xD8), g_fSmall, 1); /* Продолжить */
+    HBRUSH b2 = CreateSolidBrush(RGB(0x2A,0x1D,0x1D)); FillRect(hdc, &g_mQuit, b2); DeleteObject(b2);
+    DrawFrameAt(hdc, g_mQuit, RGB(0xC8,0x7A,0x7A));
+    TextC(hdc, (g_mQuit.left+g_mQuit.right)/2, g_mQuit.top + 6,
+          L"\x0421\x043E\x0445\x0440\x0430\x043D\x0438\x0442\x044C\x0020\x0438\x0020\x0432\x044B\x0439\x0442\x0438", RGB(0xF0,0xD8,0xD8), g_fSmall, 1); /* Сохранить и выйти */
 }
 
 /* --- Dialog window: right side, vertically centered ----------------------- */
@@ -1711,10 +1958,34 @@ static void PaintDialogBox(HDC hdc)
        word wrapping inside the frame instead of a single TextL line. */
     tr.left = r.left + 12; tr.top = r.top + 40;
     tr.right = r.right - 12; tr.bottom = r.bottom - 10;
+    /* v0.23: Yaga's dialog needs room for two clickable buy rows below */
+    if (g_speaker[0] == L'\x042F' && g_speaker[1] == L'\x0433' && g_speaker[2] == 0)
+        tr.bottom -= 68;
     SetBkMode(hdc, TRANSPARENT);
     SelectObject(hdc, g_fSmall);
     SetTextColor(hdc, RGB(0xF0,0xF0,0xF0));
     DrawTextW(hdc, g_dialogText, -1, &tr, DT_LEFT | DT_WORDBREAK);
+    /* v0.23: shop rows — click to buy (same as keys 1/2 while dialog open) */
+    if (g_speaker[0] == L'\x042F' && g_speaker[1] == L'\x0433' && g_speaker[2] == 0) {
+        int i; const wchar_t* lbl[2]; COLORREF col[2]; int price[2];
+        lbl[0] = L"\x0417\x0435\x043b\x044c\x0435 \x0431\x043e\x0434\x0440\x044f\x0448\x0435\x0435 (+30 \u0416)";
+        lbl[1] = L"\x0417\x0435\x043b\x044c\x0435 \x0441\x0438\x043b\x044b (+25 \u041c)";
+        col[0] = RGB(0xC8,0x4A,0x4A); col[1] = RGB(0x4A,0x8A,0xE0);
+        price[0] = ShopPriceHp(); price[1] = ShopPriceEn();
+        for (i = 0; i < 2; i++) {
+            RECT row = { r.left + 10, r.bottom - 62 + i * 28, r.right - 10, r.bottom - 62 + i * 28 + 24 };
+            HBRUSH rb = CreateSolidBrush(RGB(0x1D,0x22,0x33));
+            wchar_t pb[24];
+            g_shopRects[i] = row;
+            FillRect(hdc, &row, rb); DeleteObject(rb);
+            DrawFrameAt(hdc, row, g_groshi >= price[i] ? RGB(0x7A,0xC8,0x7A) : RGB(0x7A,0x4A,0x4A));
+            { RECT ir = { row.left + 3, row.top + 3, row.left + 21, row.bottom - 3 };
+              DrawShopIcon(hdc, ir, 1); }
+            TextL(hdc, row.left + 26, row.top + 5, lbl[i], RGB(0xE8,0xE0,0xC8), g_fSmall);
+            SafeWfmt(pb, 24, L"%d \x0433.", price[i]);
+            TextL(hdc, row.right - 52, row.top + 5, pb, g_groshi >= price[i] ? RGB(0xD8,0xD8,0xE4) : RGB(0xC8,0x7A,0x7A), g_fSmall);
+        }
+    }
 }
 
 /* v0.7: quest-completion popup — 5 s banner under the HUD strip */
@@ -1812,6 +2083,32 @@ static void PaintWorld(HDC hdc)
         DeleteObject(br);
         TextC(hdc, (hr.left+hr.right)/2, hr.bottom + 4,
               i == 0 ? NPC_SMITH : NPC_MARYA, RGB(0xC8,0xC8,0xD8), g_fSmall, 1);
+    }
+    /* v0.23: Yaga's shop hut (east edge of the village) */
+    {
+        RECT hr = { YAGA_X - 60, YAGA_Y - 84, YAGA_X + 60, YAGA_Y };
+        br = CreateSolidBrush(RGB(0x5A,0x3A,0x4A));
+        FillRect(hdc, &hr, br); DeleteObject(br);
+        pen = CreatePen(PS_SOLID, 2, RGB(0x33,0x22,0x2E));
+        { HPEN o = (HPEN)SelectObject(hdc, pen);
+          SelectObject(hdc, GetStockObject(NULL_BRUSH));
+          Rectangle(hdc, hr.left, hr.top, hr.right, hr.bottom);
+          MoveToEx(hdc, hr.left, hr.top, NULL); LineTo(hdc, (hr.left+hr.right)/2, hr.top - 26);
+          LineTo(hdc, hr.right, hr.top);
+          SelectObject(hdc, o); }
+        DeleteObject(pen);
+        br = CreateSolidBrush(RGB(0x2A,0x1A,0x22));
+        { RECT door = { (hr.left+hr.right)/2 - 9, hr.bottom - 36, (hr.left+hr.right)/2 + 9, hr.bottom };
+          FillRect(hdc, &door, br); }
+        DeleteObject(br);
+        /* hanging sign with a coin */
+        { RECT sg = { YAGA_X + 26, YAGA_Y - 60, YAGA_X + 62, YAGA_Y - 34 };
+          br = CreateSolidBrush(RGB(0x8A,0x6A,0x30));
+          FillRect(hdc, &sg, br); DeleteObject(br);
+          DrawFrameAt(hdc, sg, RGB(0xE8,0xC8,0x5A));
+          { RECT ir = { sg.left + 4, sg.top + 3, sg.right - 4, sg.bottom - 3 };
+            DrawShopIcon(hdc, ir, 0); } }
+        TextC(hdc, (hr.left+hr.right)/2, hr.bottom + 4, L"\x041b\x0430\x0432\x043a\x0430 \x042f\x0433\x0438", RGB(0xFF,0xE9,0x7A), g_fSmall, 1);
     }
     /* oak (OAK_X/OAK_Y are WORLD coords — no extra OFF_* offset) */
     br = CreateSolidBrush(RGB(0x5A,0x3A,0x20));
@@ -1940,6 +2237,37 @@ static void PaintWorld(HDC hdc)
     CamEnd(hdc);   /* ---------------- back to window space ---------------- */
 
     UpdateFocus();
+    /* v0.23: quest-status speech bubble above every NPC that wants talking:
+       gold pulsing "!" when the NPC has something for you RIGHT NOW,
+       gray dimmed "!" while the quest is taken/in progress, nothing once done. */
+    {
+        int k;
+        ULONGLONG now = GetTickCount64();
+        const int nx[4] = { CAT_X, SMITH_X, MARYA_X, YAGA_X };
+        const int ny[4] = { CAT_Y, SMITH_Y, MARYA_Y, YAGA_Y };
+        for (k = 0; k < 4; k++) {
+            int st = NpcTalkState(k);
+            int sx, sy;
+            if (!st) continue;
+            sx = nx[k] - g_camX; sy = ny[k] - g_camY - (k == 0 ? 58 : 108);
+            if (sx < -30 || sx > WIN_W + 30 || sy < WORLD_TOP - 20 || sy > WIN_H) continue;
+            {
+                COLORREF bgc = st == 2 ? RGB(0xE8,0xC8,0x5A) : RGB(0x77,0x7C,0x86);
+                COLORREF brc = st == 2 ? RGB(0xFF,0xF3,0xC0) : RGB(0x55,0x5A,0x62);
+                RECT bb = { sx - 11, sy - 15, sx + 11, sy + 9 };
+                POINT tail[3] = { { sx - 6, sy + 9 }, { sx + 6, sy + 9 }, { sx, sy + 18 } };
+                int pulse = (st == 2 && ((now / 300) % 2)) ? 1 : 0;
+                HBRUSH b = CreateSolidBrush(pulse ? RGB(0xFF,0xE9,0x7A) : bgc);
+                HPEN pn = CreatePen(PS_SOLID, 2, brc);
+                HPEN op = (HPEN)SelectObject(hdc, pn);
+                RoundRect(hdc, bb.left, bb.top, bb.right, bb.bottom, 8, 8);
+                SelectObject(hdc, GetStockObject(NULL_PEN));
+                Polygon(hdc, tail, 3);
+                SelectObject(hdc, op); DeleteObject(pn); DeleteObject(b);
+                TextC(hdc, sx, sy - 10, L"!", st == 2 ? RGB(0x2A,0x22,0x10) : RGB(0xD8,0xD8,0xD8), g_fMed, 1);
+            }
+        }
+    }
     if (g_focusKind) {
         const wchar_t* hint = HINT_TALK;
         int hsx = g_px - g_camX, hsy = g_py - g_camY - 34;
@@ -1969,6 +2297,7 @@ static void PaintWorld(HDC hdc)
     PaintDialogBox(hdc);
     PaintToast(hdc);
     PaintInvTooltip(hdc);   /* v0.16: item hint on hover (drawn last, above all) */
+    PaintMenuButton(hdc);   /* v0.23: MENU button bottom-right */
     /* quest tracker under focus info */
     {
         const wchar_t* qtxt;
@@ -2149,7 +2478,7 @@ static void TryPickAcorn(HWND hwnd)
        without any feedback — now every acorn shows a counter and finishing
        all three fires the completion toast immediately. */
     if (g_quest == 2 && g_acorns >= 3) {
-        Toast(TST_Q1_DONE);
+        QuestCompleteToast(1, 15, TST_Q1_DONE);   /* v0.23: banner + reward */
         QuestAdvanceCheck();
     } else if (g_quest == 2) {
         wchar_t b[64];
@@ -2485,6 +2814,7 @@ static void TalkSmith(HWND hwnd)
                afterwards, but the completion toast fires right here so the
                player sees feedback immediately. */
             if (g_quest == 3) g_quest = 4;       /* task 2 -> report to the cat */
+            EarnGroshi(20, L"\x041f\x043e\x0440\x0443\x0447\x0435\x043d\x0438\x0435 2");
             Toast(TST_Q2_DONE);
             SaveProfile();
         } else {
@@ -2525,6 +2855,7 @@ static void TalkMarya(HWND hwnd)
             InvAdd(ITEM_HEAVY, 1); InvAdd(ITEM_LEATHER, 1); InvAdd(ITEM_MANTLE, 1);
             ShowDialogTop(D_MARYA_GIVE);         /* Marya's reply to the cloth */
             if (g_quest == 4) g_quest = 5;       /* all 3 done -> cat offers profession */
+            EarnGroshi(20, L"\x041f\x043e\x0440\x0443\x0447\x0435\x043d\x0438\x0435 3");
             Toast(TST_Q3_DONE);                  /* v0.8: instant feedback */
             SaveProfile();
         } else {
@@ -2556,6 +2887,7 @@ static void ChooseProfession(HWND hwnd, int idx)
     const wchar_t* pnames[3];
     wchar_t b[256];
     g_prof = idx;                        /* v0.19: real profession id (0..2), persisted */
+    EarnGroshi(50, L"\x0421\x0442\x0435\x0437\x044f \x0438\x0437\x0431\x0440\x0430\x043d\x0430");  /* v0.23 */
     g_selected = idx;                    /* hotbar follows the profession */
     g_profBonus = 5;
     g_youngster = 0;
@@ -2595,6 +2927,9 @@ static void UpdateFocus(void)
     /* marya */
     d = sqrt((double)((g_px-MARYA_X)*(g_px-MARYA_X) + (g_py-MARYA_Y)*(g_py-MARYA_Y)));
     if (d < TALK_R && d < bd) { bd = d; kind = 1; id = 2; nm = NPC_MARYA; }
+    /* v0.23: Yaga's shop hut */
+    d = sqrt((double)((g_px-YAGA_X)*(g_px-YAGA_X) + (g_py-YAGA_Y)*(g_py-YAGA_Y)));
+    if (d < TALK_R && d < bd) { bd = d; kind = 1; id = 3; nm = L"\x041b\x0430\x0432\x043a\x0430 \x042f\x0433\x0438"; }
     /* oak */
     d = sqrt((double)((g_px-OAK_X)*(g_px-OAK_X) + (g_py-(OAK_Y+20))*(g_py-(OAK_Y+20))));
     if (d < PICK_R + 24 && d < bd) { bd = d; kind = 3; id = 0; nm = T_OAK; }
@@ -2926,9 +3261,9 @@ static LONG WINAPI TopLevelFilter(EXCEPTION_POINTERS* ep)
     h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
         SetFilePointer(h, 0, NULL, FILE_END);   /* append: keep the whole history */
-        /* build "YAV prototype v0.22: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
+        /* build "YAV prototype v0.23: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
            using only string APIs — no msvcrt printf anywhere in this path */
-        lstrcpyW(line, L"YAV prototype v0.22: exception 0x");
+        lstrcpyW(line, L"YAV prototype v0.23: exception 0x");
         WcAppendHex(line, code, 8);
         lstrcatW(line, L" at 0x");
         WcAppendHex(line, addr, 16);
@@ -3093,11 +3428,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             }
             if (g_screen != SCR_WORLD) return 0;
             switch (wp) {
-                case '1': CastAbility(hwnd, 0); break;
-                case '2': CastAbility(hwnd, 1); break;
+                case '1':
+                    /* v0.23: while Yaga's dialog is open, 1/2 buy potions */
+                    if (g_dialogShown && wcscmp(g_speaker, L"\x042f\x0433\x0430") == 0) ShopBuy(hwnd, 1);
+                    else CastAbility(hwnd, 0);
+                    break;
+                case '2':
+                    if (g_dialogShown && wcscmp(g_speaker, L"\x042f\x0433\x0430") == 0) ShopBuy(hwnd, 2);
+                    else CastAbility(hwnd, 1);
+                    break;
                 case '3': CastAbility(hwnd, 2); break;
                 case '4': CastAbility(hwnd, 3); break;
                 case '5': CastAbility(hwnd, 4); break;
+                case '6': CastAbility(hwnd, 5); break;   /* v0.23: 9-slot bar */
+                case '7': CastAbility(hwnd, 6); break;
+                case '8': CastAbility(hwnd, 7); break;
+                case '9': CastAbility(hwnd, 8); break;
                 case VK_LEFT:  case 'A': MovePlayer(hwnd, -8, 0); break;
                 case VK_RIGHT: case 'D': MovePlayer(hwnd,  8, 0); break;
                 case VK_UP:    case 'W': MovePlayer(hwnd, 0, -8); break;
@@ -3111,6 +3457,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     if (g_focusKind == 1) {
                         if (g_focusId == 0) TalkCat(hwnd);
                         else if (g_focusId == 1) TalkSmith(hwnd);
+                        else if (g_focusId == 3) TalkYaga(hwnd);   /* v0.23 shop */
                         else TalkMarya(hwnd);
                     } else if (g_focusKind == 2) {
                         TryPickAcorn(hwnd);
@@ -3144,6 +3491,36 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
         case WM_LBUTTONDOWN:
             if (g_screen == SCR_WORLD) {
                 int mx0 = GET_X_LPARAM(lp), my0 = GET_Y_LPARAM(lp), k;
+                /* v0.23: MENU button and its panel have first priority */
+                if (g_menuOpen) {
+                    if (mx0 >= g_mContinue.left && mx0 < g_mContinue.right &&
+                        my0 >= g_mContinue.top  && my0 < g_mContinue.bottom) {
+                        g_menuOpen = 0; InvalidateRect(hwnd, NULL, FALSE); return 0;
+                    }
+                    if (mx0 >= g_mQuit.left && mx0 < g_mQuit.right &&
+                        my0 >= g_mQuit.top  && my0 < g_mQuit.bottom) {
+                        SaveProfile(); g_menuOpen = 0;
+                        g_screen = SCR_LAUNCH; LayoutForScreen(hwnd);
+                        InvalidateRect(hwnd, NULL, TRUE); return 0;
+                    }
+                    g_menuOpen = 0; InvalidateRect(hwnd, NULL, FALSE); return 0;
+                }
+                if (mx0 >= g_menuRect.left && mx0 < g_menuRect.right &&
+                    my0 >= g_menuRect.top  && my0 < g_menuRect.bottom) {
+                    g_menuOpen = 1; InvalidateRect(hwnd, NULL, FALSE); return 0;
+                }
+                /* v0.23: clicking Yaga's buy rows works like keys 1/2 */
+                if (g_dialogShown && wcscmp(g_speaker, L"\x042f\x0433\x0430") == 0) {
+                    int si;
+                    for (si = 0; si < 2; si++) {
+                        RECT sr = g_shopRects[si];
+                        if (sr.right > sr.left && mx0 >= sr.left && mx0 < sr.right &&
+                            my0 >= sr.top && my0 < sr.bottom) {
+                            ShopBuy(hwnd, si + 1);
+                            return 0;
+                        }
+                    }
+                }
                 /* v0.6: clicking a hotbar button casts that ability */
                 for (k = 0; k < NABILITY; k++) {
                     RECT ar = g_abRects[k];

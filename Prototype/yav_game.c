@@ -26,6 +26,8 @@
 #define WINVER 0x0A00
 #define _WIN32_WINNT 0x0A00
 #include <windows.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>      /* v0.19: LAN co-op (UDP) */
 #include <windowsx.h>   /* GET_X_LPARAM / GET_Y_LPARAM for mouse-to-walk */
 #include <stdio.h>
 #include <string.h>
@@ -235,6 +237,7 @@ static Slot  g_inv[INV_CAP];
 static int   g_equipW = 0, g_equipA = 0, g_equipR = 0;   /* item ids or 0 */
 static int   g_invOpen = 0;
 static int   g_level = 1, g_profBonus = 0;              /* profession bonus */
+static int   g_prof = -1;                               /* v0.19: 0 Воин / 1 Лучник / 2 Волхв, -1 ещё не избрана */
 static int   g_youngster = 1;                           /* 1 = молодец, 0 = истый герой */
 /* v0.5: starter stats for the "молодец" (no class chosen at creation) */
 #define YOUNG_HP 100
@@ -284,10 +287,13 @@ static int BlockedAt(int nx, int ny)
     if (ny < VIEW_TOP + 14 || ny > WORLD_H - 40) return 1;
     /* v0.18: OAK_X/CAT_X/... are already WORLD coords — no extra OFF_* here */
     if (abs(nx - OAK_X) < 16 && ny > OAK_Y && ny < OAK_Y + 50) return 1;           /* oak trunk */
-    { int rx = 172 + OFF_X, ry = 116 + OFF_Y;
-      if (nx >= rx && nx <= rx + 176 && ny >= ry && ny <= ry + 88) return 1; }                     /* smith hut */
-    { int rx = 684 + OFF_X, ry = 116 + OFF_Y;
-      if (nx >= rx && nx <= rx + 176 && ny >= ry && ny <= ry + 88) return 1; }                     /* marya hut */
+    /* v0.19: collision boxes now DERIVED from the same world anchors that
+       PaintWorld draws with (SMITH_X/260+OFF_X, MARYA_X/772+OFF_X) — picture
+       and blocking always agree. */
+    { int rx = SMITH_X - 88, ry = SMITH_Y - 88;          /* smith hut */
+      if (nx >= rx && nx <= rx + 176 && ny >= ry && ny <= ry + 88) return 1; }
+    { int rx = MARYA_X - 88, ry = MARYA_Y - 88;          /* marya hut */
+      if (nx >= rx && nx <= rx + 176 && ny >= ry && ny <= ry + 88) return 1; }
     { int rx = 300 + OFF_X, ry = 400 + OFF_Y;
       if (nx >= rx && nx <= rx + 44 && ny >= ry && ny <= ry + 36) return 1; }                      /* well */
     return 0;
@@ -572,6 +578,7 @@ static void SaveProfile(void)
             "  \"energy\": %d,\n"
             "  \"level\": %d,\n"
             "  \"profBonus\": %d,\n"
+            "  \"prof\": %d,\n"
             "  \"youngster\": %d,\n"
             "  \"pos\": { \"x\": %d, \"y\": %d },\n"
             "  \"quest\": { \"step\": %d, \"q\": %d, \"acorns\": %d, \"catTalked\": %s, \"smith\": %d, \"marya\": %d },\n"
@@ -581,7 +588,7 @@ static void SaveProfile(void)
             "  \"loot\": [%d, %d]\n"
             "}\n",
             stamp, nutf, g_selected, g_hpCur, g_hpMax, g_energyCur,
-            g_level, g_profBonus, g_youngster, g_px, g_py,
+            g_level, g_profBonus, g_prof, g_youngster, g_px, g_py,
             g_questStep, g_quest, g_acorns, g_catTalked ? "true" : "false",
             g_smithStage, g_maryaStage,
             g_equipW, g_equipA, g_equipR, invJson,
@@ -661,6 +668,7 @@ static int LoadProfile(void) /* returns 1 if a valid profile was loaded */
         g_youngster  = JsonGetInt(buf, "youngster", (version < 4) ? 0 : 1);
         g_level      = JsonGetInt(buf, "level", 1);
         g_profBonus  = JsonGetInt(buf, "profBonus", 0);
+        g_prof       = JsonGetInt(buf, "prof", -1);   /* v0.19 */
         if (g_youngster || g_selected < 0 || g_selected >= NCLASS) {
             /* v0.5: молодец without a class — starter stats */
             g_hpMax     = YOUNG_HP;
@@ -935,6 +943,12 @@ static void DrawHero(HDC hdc)
         col = RGB(0x4A,0x5A,0x7A);            /* молодец — серый кафтан */
     else
         col = g_class[g_selected].color;
+    /* v0.19: profession overrides the old class color (so the hero you pick
+       as Воин/Лучник/Волхв is actually drawn in that colour) */
+    if (g_prof >= 0 && g_prof < 3) {
+        static const COLORREF pc[3] = { RGB(0xB4,0x3A,0x2E), RGB(0x3F,0x8A,0x3F), RGB(0x6A,0x4A,0xC8) };
+        col = pc[g_prof];
+    }
     /* shadow */
     FillEllipse(hdc, sx, sy + 14, 10, 4, RGB(0x40,0x55,0x35));
     /* body */
@@ -1730,12 +1744,13 @@ static void PaintWorld(HDC hdc)
       SelectObject(hdc, fo); DeleteObject(fp); }
     /* road across the village */
     RectFill(hdc, OFF_X, OFF_Y + 300, WIN_W, 60, RGB(0x3A,0x34,0x2A));
-    /* huts: smith (left) and marya (right). SMITH_X/MARYA_X are already
-       WORLD coords — the old code added OFF_X a second time, which pushed
-       every object off-screen ("объекты разбежались"). */
+    /* v0.19: huts are drawn at their TRUE world positions (SMITH_X/SMITH_Y),
+       so the picture and the collision boxes always match — previously the
+       hut was painted at one place and blocked you somewhere else. */
     for (i = 0; i < 2; i++) {
-        int hx = (i == 0 ? SMITH_X - 66 : MARYA_X - 66);
-        RECT hr = { hx, OFF_Y + 116, hx + 132, OFF_Y + 204 };
+        int cxw = (i == 0 ? SMITH_X : MARYA_X);   /* hut centre x (world) */
+        int cyw = (i == 0 ? SMITH_Y : MARYA_Y);   /* door line y  (world) */
+        RECT hr = { cxw - 66, cyw - 88, cxw + 66, cyw };
         br = CreateSolidBrush(RGB(0x6A,0x4A,0x2A));
         FillRect(hdc, &hr, br); DeleteObject(br);
         pen = CreatePen(PS_SOLID, 2, RGB(0x3A,0x2A,0x1A));
@@ -1802,22 +1817,28 @@ static void PaintWorld(HDC hdc)
     DrawVillageCatParts(hdc);
     /* hero: head, class-colored body, nickname below (camera-offset inside) */
     DrawHero(hdc);
-    /* focus ring around focused entity */
+    /* focus ring around focused entity (v0.19: CAT_X/SMITH_X are ALREADY world
+       coords — the extra +OFF_* here doubled the offset and drew the ring on
+       top of a pine tree far from the NPC, part of "объекты разбежались") */
     if (g_focusKind == 1) {
-        int fx = (g_focusId == 0 ? CAT_X : g_focusId == 1 ? SMITH_X : MARYA_X) + OFF_X;
-        int fy = (g_focusId == 0 ? CAT_Y : g_focusId == 1 ? SMITH_Y + 30 : MARYA_Y + 30) + OFF_Y;
+        int fx = (g_focusId == 0 ? CAT_X : g_focusId == 1 ? SMITH_X : MARYA_X);
+        int fy = (g_focusId == 0 ? CAT_Y : g_focusId == 1 ? SMITH_Y + 30 : MARYA_Y + 30);
         HPEN fp = CreatePen(PS_SOLID, 2, RGB(0xFF,0xE9,0x7A));
         HPEN fo = (HPEN)SelectObject(hdc, fp);
         SelectObject(hdc, GetStockObject(NULL_BRUSH));
         Ellipse(hdc, fx - 26, fy - 24, fx + 26, fy + 24);
         SelectObject(hdc, fo); DeleteObject(fp);
     }
+    /* v0.19: the old "hint above player" block drew its text in WORLD coords
+       while the camera transform was already reset — with a panned camera the
+       hint appeared hundreds of px away from the hero (part of the "карта
+       разбежалась" complaint). It is now drawn AFTER CamEnd in screen space. */
     CamEnd(hdc);   /* ---------------- back to window space ---------------- */
 
-    /* hint above player (screen coords so it never scrolls off) */
     UpdateFocus();
     if (g_focusKind) {
         const wchar_t* hint = HINT_TALK;
+        int hsx = g_px - g_camX, hsy = g_py - g_camY - 34;
         if (g_focusKind == 2) hint = HINT_PICK;
         else if (g_focusKind == 3) hint = (g_focusId == 0) ? HINT_PICK : HINT_LEAVE;
         else if (g_focusKind == 1) {
@@ -1831,8 +1852,10 @@ static void PaintWorld(HDC hdc)
                 else hint = HINT_DONE;
             }
         }
-        TextC(hdc, g_px - g_camX, g_py - g_camY - 34, hint, RGB(0xFF,0xE9,0x7A), g_fSmall, 1);
+        TextC(hdc, hsx, hsy, hint, RGB(0xFF,0xE9,0x7A), g_fSmall, 1);
     }
+    /* v0.19: LAN peers (other players) — drawn in screen space after CamEnd */
+    NetDrawPeers(hdc);
     /* HUD layers */
     PaintPlayerPanel(hdc);
     PaintMinimap(hdc);      /* v0.18: big-world minimap, top-right corner */
@@ -2094,7 +2117,7 @@ int main(void)
 
     /* --- character creation exactly like IDC_BTN_CHOOSE does --- */
     lstrcpynW(g_nick, L"Test", 64);
-    g_selected = -1; g_youngster = 1; g_level = 1; g_profBonus = 0;
+    g_selected = -1; g_prof = -1; g_youngster = 1; g_level = 1; g_profBonus = 0;
     g_hpMax = YOUNG_HP; g_hpCur = YOUNG_HP;
     g_energyMax = YOUNG_EN; g_energyCur = YOUNG_EN;
     g_questStep = 0; g_acorns = 0; g_catTalked = 0; g_quest = 0;
@@ -2411,6 +2434,7 @@ static void ChooseProfession(HWND hwnd, int idx)
 {
     const wchar_t* pnames[3];
     wchar_t b[256];
+    g_prof = idx;                        /* v0.19: real profession id (0..2), persisted */
     g_selected = idx;                    /* hotbar follows the profession */
     g_profBonus = 5;
     g_youngster = 0;
@@ -2519,6 +2543,155 @@ static void WalkToward(HWND hwnd)
     }
     if (GetTickCount64() - g_lastSave > 2000) SaveProfile();
     InvalidateRect(hwnd, NULL, FALSE);
+}
+
+/* ---------------- v0.19: LAN co-op (UDP broadcast, peer-to-peer) ----------
+   Two windows on the same PC / LAN see each other and each other's heroes.
+   NOTE: this is a *prototype* for feel-testing only. The real game stays
+   server-authoritative (Unity NGO/Mirror): positions here are trusted as-is,
+   which is fine on localhost but MUST be validated by the server later. */
+#define NET_PORT 47811
+#define MAX_PEERS 8
+typedef struct {
+    int      used;
+    SOCKADDR_IN addr;
+    wchar_t  nick[32];
+    int      x, y, hp, prof;
+    ULONGLONG lastSeen;
+} Peer;
+static Peer        g_peers[MAX_PEERS];
+static SOCKET      g_udpSock = INVALID_SOCKET;
+static DWORD       g_peerToken = 0;     /* distinguishes two windows of one exe */
+static char        g_netTag[6] = "YAVP"; /* packet magic */
+
+typedef struct {
+    char      tag[4];      /* YAVP */
+    unsigned  token;       /* per-window id */
+    short     ver;         /* struct version = 1 */
+    short     nickBytes;   /* UTF-16 byte count of nickname */
+    int       x, y, hp, prof, level;
+} NetPacket;               /* fixed header + raw UTF-16 nickname appended */
+
+static void NetInit(HWND hwnd)
+{
+    WSADATA wsa;
+    SOCKADDR_IN sa;
+    BOOL opt = TRUE;
+    if (g_udpSock != INVALID_SOCKET) return;      /* already up */
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+    g_udpSock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if (g_udpSock == INVALID_SOCKET) return;
+    setsockopt(g_udpSock, SOL_SOCKET, SO_REUSEADDR, (const char*)&opt, sizeof(opt));
+    setsockopt(g_udpSock, SOL_SOCKET, SO_BROADCAST, (const char*)&opt, sizeof(opt));
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_addr.s_addr = INADDR_ANY;
+    sa.sin_port = htons((unsigned short)NET_PORT);
+    if (bind(g_udpSock, (SOCKADDR*)&sa, sizeof(sa)) == SOCKET_ERROR) {
+        /* port busy — keep unbound; we still can't hear peers, hero works solo */
+        closesocket(g_udpSock); g_udpSock = INVALID_SOCKET; return;
+    }
+    g_peerToken = GetTickCount() ^ GetCurrentProcessId();
+    SetTimer(hwnd, 3, 100, NULL);                 /* 10 Hz announce tick */
+}
+static void NetAnnounce(HWND hwnd)
+{
+    if (g_udpSock == INVALID_SOCKET) return;
+    {
+        NetPacket p;
+        int nb = (int)lstrlenW(g_nick) * 2;
+        SOCKADDR_IN bcast;
+        char buf[sizeof(NetPacket) + 64];
+        memset(&p, 0, sizeof(p));
+        memcpy(p.tag, g_netTag, 4);
+        p.token = g_peerToken; p.ver = 1;
+        p.nickBytes = (short)nb;
+        p.x = g_px; p.y = g_py; p.hp = g_hpCur; p.prof = g_prof; p.level = g_level;
+        memcpy(buf, &p, sizeof(p));
+        if (nb > 0 && nb <= 64) memcpy(buf + sizeof(p), g_nick, nb);
+        memset(&bcast, 0, sizeof(bcast));
+        bcast.sin_family = AF_INET;
+        bcast.sin_addr.s_addr = INADDR_BROADCAST;
+        bcast.sin_port = htons((unsigned short)NET_PORT);
+        sendto(g_udpSock, buf, (int)sizeof(p) + nb, 0, (SOCKADDR*)&bcast, sizeof(bcast));
+        /* also target every known peer directly (broadcast routers often drop) */
+        { int i;
+          for (i = 0; i < MAX_PEERS; i++)
+              if (g_peers[i].used)
+                  sendto(g_udpSock, buf, (int)sizeof(p) + nb, 0,
+                         (SOCKADDR*)&g_peers[i].addr, sizeof(SOCKADDR_IN));
+        }
+    }
+    (void)hwnd;
+}
+static void NetPoll(void)
+{
+    u_long avail = 0;
+    if (g_udpSock == INVALID_SOCKET) return;
+    while (ioctlsocket(g_udpSock, FIONREAD, &avail) == 0 && avail > 0) {
+        char buf[256];
+        SOCKADDR_IN from;
+        int flen = (int)sizeof(from);
+        int n = recvfrom(g_udpSock, buf, sizeof(buf), 0, (SOCKADDR*)&from, &flen);
+        if (n >= (int)sizeof(NetPacket)) {
+            NetPacket* p = (NetPacket*)buf;
+            int i, nb;
+            if (memcmp(p->tag, g_netTag, 4) != 0 || p->ver != 1) continue;
+            if (p->token == g_peerToken) continue;           /* our own echo */
+            nb = p->nickBytes;
+            if (nb < 0 || nb > 64 || nb > n - (int)sizeof(NetPacket)) nb = 0;
+            i = 0;
+            for (; i < MAX_PEERS; i++)
+                if (g_peers[i].used && g_peers[i].addr.sin_addr.s_addr == from.sin_addr.s_addr
+                    && g_peers[i].addr.sin_port == from.sin_port) break;
+            if (i == MAX_PEERS) {                             /* new peer slot */
+                for (i = 0; i < MAX_PEERS; i++)
+                    if (!g_peers[i].used) break;
+                if (i == MAX_PEERS) i = 0;                    /* recycle oldest slot */
+                g_peers[i].used = 1;
+                g_peers[i].addr = from;
+            }
+            g_peers[i].x = p->x; g_peers[i].y = p->y;
+            g_peers[i].hp = p->hp; g_peers[i].prof = p->prof;
+            g_peers[i].lastSeen = GetTickCount64();
+            lstrcpynW(g_peers[i].nick, L"", 32);
+            if (nb > 0) { memcpy(g_peers[i].nick, buf + (int)sizeof(NetPacket), nb);
+                          g_peers[i].nick[nb / 2] = 0; }
+        } else if (n >= 0) { /* malformed small packet: ignore */ }
+    }
+    /* expire silent peers (>2 s) */
+    { int i;
+      for (i = 0; i < MAX_PEERS; i++)
+          if (g_peers[i].used && GetTickCount64() - g_peers[i].lastSeen > 2000)
+              g_peers[i].used = 0;
+    }
+}
+static void NetDrawPeers(HDC hdc)
+{
+    static const COLORREF pc[3] = { RGB(0xB4,0x3A,0x2E), RGB(0x3F,0x8A,0x3F), RGB(0x6A,0x4A,0xC8) };
+    int i;
+    wchar_t line[64];
+    for (i = 0; i < MAX_PEERS; i++) {
+        int sx, sy;
+        COLORREF col;
+        if (!g_peers[i].used) continue;
+        sx = g_peers[i].x - g_camX; sy = g_peers[i].y - g_camY;   /* world -> screen */
+        if (sx < -40 || sx > WIN_W + 40 || sy < VIEW_TOP - 40 || sy > WIN_H + 40) {
+            /* off-screen: draw an edge arrow instead so you know where they are */
+            continue;
+        }
+        col = (g_peers[i].prof >= 0 && g_peers[i].prof < 3) ? pc[g_peers[i].prof] : RGB(0x4A,0x5A,0x7A);
+        FillEllipse(hdc, sx, sy + 14, 10, 4, RGB(0x40,0x55,0x35)); /* shadow */
+        FillEllipse(hdc, sx, sy + 2, 8, 11, col);                  /* body */
+        FillCircle(hdc, sx, sy - 14, 7, RGB(0xE8,0xC8,0x9A));      /* head */
+        SafeWfmt(line, 64, L"%ls · ур.%d", g_peers[i].nick[0] ? g_peers[i].nick : L"брат", 0);
+        { int lv = g_peers[i].level; char* q = wcschr(line, L'\0'); (void)q;
+          /* re-format with level: simpler second pass */
+          SafeWfmt(line, 64, L"%ls", g_peers[i].nick[0] ? g_peers[i].nick : L"брат");
+          if (lv > 0) { wchar_t t[24]; SafeWfmt(t, 24, L" · ур.%d", lv);
+                        if (lstrlenW(line) + lstrlenW(t) < 60) lstrcatW(line, t); } }
+        TextC(hdc, sx, sy + 20, line, RGB(0xC8,0xFF,0xC8), g_fSmall, 1);
+    }
 }
 
 /* ------------------------------- Abilities -------------------------------- */
@@ -2903,7 +3076,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     if (!nick[0]) { MessageBoxW(hwnd, H_WARNNICK, APP_TITLE, MB_OK | MB_ICONWARNING); SetFocus(g_editNick); break; }
                     lstrcpynW(g_nick, nick, 64);
                     g_selected = -1;                 /* no class until profession is chosen */
-                    g_youngster = 1; g_level = 1; g_profBonus = 0;
+                    g_prof = -1; g_youngster = 1; g_level = 1; g_profBonus = 0;
                     g_hpMax = YOUNG_HP; g_hpCur = YOUNG_HP;
                     g_energyMax = YOUNG_EN; g_energyCur = YOUNG_EN;
                     g_questStep = 0; g_acorns = 0; g_catTalked = 0; g_quest = 0;
@@ -2924,7 +3097,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     wchar_t wpath[MAX_PATH];
                     hasProfile = 0;
                     g_selected = -1; g_nick[0] = 0;
-                    g_youngster = 1; g_level = 1; g_profBonus = 0;
+                    g_prof = -1; g_youngster = 1; g_level = 1; g_profBonus = 0;
                     g_hpMax = YOUNG_HP; g_hpCur = YOUNG_HP;
                     g_energyMax = YOUNG_EN; g_energyCur = YOUNG_EN;
                     g_quest = 0; g_questStep = 0; g_acorns = 0; g_catTalked = 0;

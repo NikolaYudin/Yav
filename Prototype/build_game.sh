@@ -13,7 +13,7 @@ echo "[1/2] Компиляция x86_64-w64-mingw32-gcc..."
 x86_64-w64-mingw32-gcc -O2 -Wall -mwindows \
     yav_game.c \
     -o YavLaunch.exe \
-    -lmsimg32 -lgdi32 -luser32 -lkernel32
+    -lmsimg32 -lgdi32 -luser32 -lkernel32 -lws2_32
 
 echo "[2/2] Утяжка (strip)..."
 x86_64-w64-mingw32-strip -s YavLaunch.exe || true

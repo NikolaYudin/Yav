@@ -128,6 +128,11 @@ static void DrawFrameAt(HDC hdc, RECT r, COLORREF c);
 static void DrawCatExtras(HDC hdc);
 static void DrawVillageCatParts(HDC hdc);
 static void DrawHero(HDC hdc);
+/* v0.19: LAN co-op forward declarations (definitions further down) */
+static void NetInit(HWND hwnd);
+static void NetPoll(void);
+static void NetAnnounce(HWND hwnd);
+void      NetDrawPeers(HDC hdc);
 /* v0.18: minimap + weapon emblems on the profession screen */
 static void PaintMinimap(HDC hdc);
 static void DrawItemIcon(HDC hdc, RECT ir, int id, COLORREF base);
@@ -1999,6 +2004,7 @@ static void EnterWorld(HWND hwnd)
         if (g_quest >= 4 && !InvCount(ITEM_CLOTH)) InvAdd(ITEM_CLOTH, 1);
     }
     g_screen = SCR_WORLD;
+    NetInit(hwnd);                 /* v0.19: LAN co-op (UDP broadcast) */
     SetTimer(hwnd, 2, 50, NULL);   /* mouse-walk / regen tick */
     LayoutForScreen(hwnd);
     SetFocus(hwnd);
@@ -2556,7 +2562,7 @@ typedef struct {
     int      used;
     SOCKADDR_IN addr;
     wchar_t  nick[32];
-    int      x, y, hp, prof;
+    int      x, y, hp, prof, level;
     ULONGLONG lastSeen;
 } Peer;
 static Peer        g_peers[MAX_PEERS];
@@ -2652,7 +2658,7 @@ static void NetPoll(void)
                 g_peers[i].addr = from;
             }
             g_peers[i].x = p->x; g_peers[i].y = p->y;
-            g_peers[i].hp = p->hp; g_peers[i].prof = p->prof;
+            g_peers[i].hp = p->hp; g_peers[i].prof = p->prof; g_peers[i].level = p->level;
             g_peers[i].lastSeen = GetTickCount64();
             lstrcpynW(g_peers[i].nick, L"", 32);
             if (nb > 0) { memcpy(g_peers[i].nick, buf + (int)sizeof(NetPacket), nb);
@@ -2666,7 +2672,7 @@ static void NetPoll(void)
               g_peers[i].used = 0;
     }
 }
-static void NetDrawPeers(HDC hdc)
+void NetDrawPeers(HDC hdc)
 {
     static const COLORREF pc[3] = { RGB(0xB4,0x3A,0x2E), RGB(0x3F,0x8A,0x3F), RGB(0x6A,0x4A,0xC8) };
     int i;
@@ -2844,6 +2850,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         }
         case WM_TIMER:
+            if (g_screen == SCR_WORLD) { NetPoll(); NetAnnounce(hwnd); }
             AdvanceTick(hwnd);
             return 0;
         case WM_CTLCOLORSTATIC:
@@ -3120,6 +3127,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         case WM_DESTROY:
             KillTimer(hwnd, 1);
+            KillTimer(hwnd, 3);
+            if (g_udpSock != INVALID_SOCKET) { closesocket(g_udpSock); g_udpSock = INVALID_SOCKET; WSACleanup(); }
             /* v0.18: release the cached minimap bitmap/DC */
             if (g_mmBaseDC) { DeleteDC(g_mmBaseDC); g_mmBaseDC = NULL; }
             if (g_mmBase)   { DeleteObject(g_mmBase);   g_mmBase = NULL; }

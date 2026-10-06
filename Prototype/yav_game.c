@@ -287,6 +287,10 @@ static int   g_invOpen = 0;
 static int   g_charOpen = 0;
 static RECT  g_charRects[12];
 static int   g_charGridN = 0;
+/* v0.27: bag cells inside the character sheet (grid, not list) */
+#define CHAR_BAG_N 24
+static RECT  g_charBagRects[CHAR_BAG_N];
+static int   g_charBagN = 0;
 static int   g_level = 1, g_profBonus = 0;              /* profession bonus */
 /* v0.25: experience bar + profession unlocks at level 5 */
 static int   g_xp = 0;
@@ -1697,11 +1701,104 @@ static void PaintFocusInfo(HDC hdc)
     TextC(hdc, WIN_W/2, 16, b, RGB(0xE8,0xE0,0xC8), g_fSmall, 1);
 }
 
+/* ==================== v0.27: PNG sprites via GDI+ =========================
+   User-loaded sprites live next to the exe:  sprites/items/<name>.png
+   If a sprite is present it replaces the procedural pixel icon; otherwise the
+   old vector drawing is used as fallback (so the build never looks broken). */
+#include <gdiplus.h>
+static ULONG_PTR g_gdipToken = 0;
+#define SPRITE_SLOTS 32
+static void*     g_sprite[SPRITE_SLOTS];      /* Image* handles per item id */
+
+/* dynamic GDI+ entry points (mingw headers declare classes, not the C API) */
+typedef int YPStatus;
+typedef void* YPImage; typedef void* YPGraphics;
+static YPStatus (WINAPI *pGpStartup)(ULONG_PTR*, const GdiplusStartupInput*, void*);
+static void     (WINAPI *pGpShutdown)(ULONG_PTR);
+static YPStatus (WINAPI *pGpLoadImage)(const WCHAR*, YPImage*);
+static void     (WINAPI *pGpDisposeImage)(YPImage);
+static YPStatus (WINAPI *pGpImgW)(YPImage, UINT*);
+static YPStatus (WINAPI *pGpImgH)(YPImage, UINT*);
+static YPStatus (WINAPI *pGpFromHdc)(HDC, YPGraphics*);
+static void     (WINAPI *pGpDelGr)(YPGraphics);
+static YPStatus (WINAPI *pGpSetIM)(YPGraphics, INT);
+static YPStatus (WINAPI *pGpDrawImg)(YPGraphics, YPImage, REAL, REAL, REAL, REAL);
+static int GpResolve(void)
+{
+    HMODULE g = LoadLibraryW(L"gdiplus.dll"); FARPROC b;
+    if (!g) return 0;
+    b = GetProcAddress(g, "GdiplusStartup");      *(void**)&pGpStartup   = b;
+    *(void**)&pGpShutdown   = GetProcAddress(g, "GdiplusShutdown");
+    *(void**)&pGpLoadImage  = GetProcAddress(g, "GdipLoadImageFromFile");
+    *(void**)&pGpDisposeImage= GetProcAddress(g, "GdipDisposeImage");
+    *(void**)&pGpImgW       = GetProcAddress(g, "GdipGetImageWidth");
+    *(void**)&pGpImgH       = GetProcAddress(g, "GdipGetImageHeight");
+    *(void**)&pGpFromHdc    = GetProcAddress(g, "GdipGraphicsFromHDC");
+    *(void**)&pGpDelGr      = GetProcAddress(g, "GdipDeleteGraphics");
+    *(void**)&pGpSetIM      = GetProcAddress(g, "GdipSetInterpolationMode");
+    *(void**)&pGpDrawImg    = GetProcAddress(g, "GdipDrawImageRectRRF");
+    return pGpStartup && pGpLoadImage && pGpFromHdc && pGpDrawImg;
+}
+
+static void SpritesInit(void)
+{
+    GdiplusStartupInput si;
+    wchar_t path[MAX_PATH]; static const struct { int id; const wchar_t* f; } map[] = {
+        { ITEM_ACORN,  L"sprites/items/acorn.png" },
+        { ITEM_METAL,  L"sprites/items/ruda.png" },
+        { ITEM_CLOTH,  L"sprites/items/polotno.png" },
+        { ITEM_POTION, L"sprites/items/zele_health.png" },
+    };
+    size_t i;
+    if (g_gdipToken) return;
+    if (!GpResolve()) return;
+    si.GdiplusVersion = 1; si.DebugEventCallback = NULL;
+    si.SuppressBackgroundThread = 0;
+    if (pGpStartup(&g_gdipToken, &si, NULL) != 0) { g_gdipToken = 0; return; }
+    GetModuleFileNameW(NULL, path, MAX_PATH);
+    if (wcsrchr(path, L'\\')) wcscpy(wcsrchr(path, L'\\') + 1, L"");
+    else wcscpy(path, L"");
+    for (i = 0; i < sizeof(map)/sizeof(map[0]); i++) {
+        wchar_t full[MAX_PATH]; lstrcpyW(full, path); lstrcatW(full, map[i].f);
+        { YPImage img = NULL;
+          if (pGpLoadImage(full, &img) == 0 && img) g_sprite[map[i].id] = img; }
+    }
+}
+static void SpritesFree(void)
+{
+    size_t i;
+    if (!g_gdipToken) return;
+    for (i = 0; i < SPRITE_SLOTS; i++)
+        if (g_sprite[i]) { pGpDisposeImage(g_sprite[i]); g_sprite[i] = NULL; }
+    pGpShutdown(g_gdipToken); g_gdipToken = 0;
+}
+/* draw loaded sprite (if any) into slot rect; returns 1 if drawn */
+static int SpriteDraw(HDC hdc, RECT ir, int id)
+{
+    YPGraphics gr = NULL; UINT w = 0, h = 0; float s, ox, oy;
+    if (!g_gdipToken || id <= 0 || id >= SPRITE_SLOTS || !g_sprite[id]) return 0;
+    if (pGpImgW(g_sprite[id], &w) != 0) return 0;
+    pGpImgH(g_sprite[id], &h);
+    if (w == 0 || h == 0) return 0;
+    { int rw = ir.right - ir.left, rh = ir.bottom - ir.top;
+      s = (float)(rw < rh ? rw : rh) * 0.82f / (float)(w > h ? w : h);
+      ox = (float)ir.left + ((float)rw - w * s) / 2.0f;
+      oy = (float)ir.top  + ((float)rh - h * s) / 2.0f; }
+    if (pGpFromHdc(hdc, &gr) != 0 || !gr) return 0;
+    pGpSetIM(gr, 7 /*NearestNeighbor*/);
+    pGpDrawImg(gr, g_sprite[id], ox, oy, (REAL)(w * s), (REAL)(h * s));
+    pGpDelGr(gr);
+    return 1;
+}
+
 /* --- Inventory panel (left side, Tab toggle) ------------------------------ */
 /* v0.16: simple vector icons for items (drawn inside a slot rect).
-   Replaces the old flat color square so every item is recognizable. */
+   Replaces the old flat color square so every item is recognizable.
+   v0.27: PNG sprite from sprites/items/ takes priority over this fallback. */
 static void DrawItemIcon(HDC hdc, RECT ir, int id, COLORREF base)
 {
+    if (SpriteDraw(hdc, ir, id)) return;   /* user sprite wins */
+    {
     HPEN pen; HBRUSH br; POINT poly[4];
     int cx = (ir.left + ir.right) / 2, cy = (ir.top + ir.bottom) / 2;
     int w = ir.right - ir.left, h = ir.bottom - ir.top;
@@ -1781,6 +1878,7 @@ static void DrawItemIcon(HDC hdc, RECT ir, int id, COLORREF base)
         br = CreateSolidBrush(base); FillRect(hdc, &ir, br); DeleteObject(br);
         break;
     }
+    }
 }
 
 static int CharEquipIdForSlot(int i);
@@ -1813,6 +1911,20 @@ static void PaintInvTooltip(HDC hdc)
             else     SafeWfmt(cb, 96, L"%ls \x2014 \x043f\x0443\x0441\x0442\x043e", nm);
             tip = cb;
             goto draw_tip;
+        }
+        /* v0.27: bag cells in the sheet — show item name + action hint */
+        for (i = 0; i < g_charBagN; i++) {
+            RECT r = g_charBagRects[i];
+            if (r.right > r.left && g_mouseX >= r.left && g_mouseX < r.right &&
+                g_mouseY >= r.top && g_mouseY < r.bottom) {
+                if (g_inv[i].id) {
+                    const ItemDef* d = Item(g_inv[i].id);
+                    SafeWfmt(cb, 96, L"%ls \x00d7%d \x2014 \x043a\x043b\x0438\x043a: \x043d\x0430\x0434\x0435\x0442\x044c/\x0432\x044b\x043f\x0438\x0442\x044c",
+                             d->name, g_inv[i].count);
+                } else SafeWfmt(cb, 96, L"\x042f\x0447\x0435\x0439\x043a\x0430 %d \x2014 \x043f\x0443\x0441\x0442\x043e", i + 1);
+                tip = cb;
+                goto draw_tip;
+            }
         }
     }
     if (idx < 0 || !g_inv[idx].id) return;
@@ -1905,7 +2017,9 @@ static void DrawDropIcon(HDC hdc, int cx, int cy, COLORREF c)
 }
 static void PaintCharWindow(HWND hwnd, HDC hdc)
 {
-    int wx = WIN_W/2 - 300, wy = WIN_H/2 - 232, ww = 600, wh = 464;
+    /* v0.27: sheet enlarged to 900x560 so the BAG is a real cell grid
+       (6 cols x 4 rows = 24 slots) instead of a vertical list. */
+    int wx = WIN_W/2 - 450, wy = WIN_H/2 - 280, ww = 900, wh = 560;
     RECT win = { wx, wy, wx + ww, wy + wh };
     HBRUSH br; int i; wchar_t b[96];
     const wchar_t* pname[3];
@@ -1988,35 +2102,43 @@ static void PaintCharWindow(HWND hwnd, HDC hdc)
                 eid ? RGB(0xFF,0xF3,0xC0) : RGB(0x6A,0x62,0x58), g_fSmall, 1);
       }
     }
-    /* --- right column: the BAG (resources), 7 rows ----------------------- */
-    { int rx = wx + 264, ry = wy + 132;
-      struct { int id; const wchar_t* nm; int cnt; COLORREF col; } res[7];
-      res[0].id = 0;           res[0].nm = L"\x0413\x0440\x043e\x0448\x0438"; res[0].cnt = g_groshi;             res[0].col = RGB(0xE0,0xB0,0x40);
-      res[1].id = ITEM_METAL;  res[1].nm = IT_METAL;  res[1].cnt = InvCount(ITEM_METAL);  res[1].col = RGB(0x8A,0x8A,0x94);
-      res[2].id = ITEM_CLOTH;  res[2].nm = IT_CLOTH;  res[2].cnt = InvCount(ITEM_CLOTH);  res[2].col = RGB(0xE8,0xE0,0xC8);
-      res[3].id = ITEM_ACORN;  res[3].nm = IT_ACORN;  res[3].cnt = InvCount(ITEM_ACORN);  res[3].col = RGB(0xC8,0x8A,0x3E);
-      res[4].id = ITEM_POTION; res[4].nm = IT_POTION; res[4].cnt = InvCount(ITEM_POTION); res[4].col = RGB(0x4A,0xA0,0x60);
-      res[5].id = ITEM_POT_EN; res[5].nm = L"\x0417\x0435\x043b\x044c\x0435 \x0441\x0438\x043b\x044b"; res[5].cnt = InvCount(ITEM_POT_EN); res[5].col = RGB(0x4A,0x8A,0xE0);
-      res[6].id = ITEM_AMULET; res[6].nm = IT_AMULET; res[6].cnt = InvCount(ITEM_AMULET); res[6].col = RGB(0xE0,0xB0,0x40);
+    /* --- right column: the BAG as a CELL GRID 6x4 (v0.27: cells, not rows) */
+    { int rx = wx + 268, ry = wy + 132;
+      int bc = 6, cell = 52, gap = 6;
       TextL(hdc, rx, ry - 18, L"\x0421\x0443\x043c\x043a\x0430", RGB(0xC8,0x9A,0x3E), g_fSmall);   /* v0.25: "bag", not "resources" */
-      for (i = 0; i < 7; i++) {
-          RECT rr = { rx, ry + i * 44, rx + 320, ry + i * 44 + 40 };
-          /* v0.25: gold highlight when the mouse hovers the row */
-          int hov = (g_mouseX >= rr.left && g_mouseX < rr.right &&
-                     g_mouseY >= rr.top  && g_mouseY < rr.bottom);
-          br = CreateSolidBrush(RGB(hov?0x2A:0x18, hov?0x24:0x14, hov?0x18:0x10));
-          FillRect(hdc, &rr, br); DeleteObject(br);
-          DrawFrameAt(hdc, rr, hov ? RGB(0xFF,0xE9,0x7A) : RGB(0x6A,0x50,0x28));
-          { RECT ir = { rr.left + 4, rr.top + 4, rr.left + 36, rr.bottom - 4 };
-            if (res[i].id == 0) {
-                FillCircle(hdc, (ir.left+ir.right)/2, (ir.top+ir.bottom)/2, 12, res[i].col);
-                FillCircle(hdc, (ir.left+ir.right)/2, (ir.top+ir.bottom)/2, 6, RGB(0xB0,0x80,0x20));
-            } else DrawItemIcon(hdc, ir, res[i].id, res[i].col); }
-          TextL(hdc, rr.left + 44, rr.top + 6, res[i].nm, RGB(0xD8,0xD0,0xC0), g_fSmall);
-          SafeWfmt(b, 96, L"x%d", res[i].cnt);
-          TextR(hdc, rr.right - 8, rr.top + 6, b,
-                res[i].cnt ? RGB(0xFF,0xF3,0xC0) : RGB(0x6A,0x62,0x58), g_fSmall);
+      g_charBagN = 0;
+      for (i = 0; i < 24 && i < INV_CAP; i++) {
+          int cx2 = rx + (i % bc) * (cell + gap);
+          int cy2 = ry + (i / bc) * (cell + gap);
+          RECT sr = { cx2, cy2, cx2 + cell, cy2 + cell };
+          int hov = (g_mouseX >= cx2 && g_mouseX < cx2 + cell &&
+                     g_mouseY >= cy2 && g_mouseY < cy2 + cell);
+          g_charBagRects[g_charBagN++] = sr;
+          br = CreateSolidBrush(RGB(0x14,0x12,0x10));
+          FillRect(hdc, &sr, br); DeleteObject(br);
+          DrawFrameAt(hdc, sr, hov ? RGB(0xFF,0xE9,0x7A) : RGB(0x6A,0x50,0x28));
+          if (g_inv[i].id) {
+              const ItemDef* d = Item(g_inv[i].id);
+              RECT ir = { sr.left + 8, sr.top + 6, sr.right - 8, sr.bottom - 18 };
+              DrawItemIcon(hdc, ir, d->id, d->col);
+              SafeWfmt(b, 96, L"%d", g_inv[i].count);
+              TextR(hdc, sr.right - 5, sr.bottom - 16, b, RGB(0xFF,0xF3,0xC0), g_fSmall);
+              if (IsEquipped(d->id))
+                  TextL(hdc, sr.left + 4, sr.bottom - 16, L"\x041d", RGB(0xFF,0xE9,0x7A), g_fSmall);
+          }
       }
+      /* currency row under the grid: гроши (not an item slot) */
+      { RECT cr = { rx, ry + 4*(cell+gap) + 6, rx + bc*(cell+gap) - gap, ry + 4*(cell+gap) + 40 };
+        int hov = (g_mouseX >= cr.left && g_mouseX < cr.right &&
+                   g_mouseY >= cr.top  && g_mouseY < cr.bottom);
+        br = CreateSolidBrush(RGB(hov?0x2A:0x18, hov?0x24:0x14, hov?0x18:0x10));
+        FillRect(hdc, &cr, br); DeleteObject(br);
+        DrawFrameAt(hdc, cr, hov ? RGB(0xFF,0xE9,0x7A) : RGB(0x6A,0x50,0x28));
+        FillCircle(hdc, cr.left + 18, cr.top + 14, 9, RGB(0xE0,0xB0,0x40));
+        FillCircle(hdc, cr.left + 18, cr.top + 14, 4, RGB(0xB0,0x80,0x20));
+        TextL(hdc, cr.left + 34, cr.top + 6, L"\x0413\x0440\x043e\x0448\x0438", RGB(0xD8,0xD0,0xC0), g_fSmall);
+        SafeWfmt(b, 96, L"%d", g_groshi);
+        TextR(hdc, cr.right - 8, cr.top + 6, b, RGB(0xFF,0xF3,0xC0), g_fSmall); }
     }
     /* footer hint inside the sheet */
     TextC(hdc, wx + ww/2, wy + wh - 22,
@@ -2027,9 +2149,9 @@ static void PaintCharWindow(HWND hwnd, HDC hdc)
 static void PaintInventory(HDC hdc)
 {
     int cell = 40, cols = 3, i;
-    /* v0.16: right-anchored bag panel (the old left column overlapped the
-       hero HUD after the move to 1024x768). */
-    int x0 = WIN_W - 10 - cols*cell, y0 = 110;
+    /* v.27: the quick-bag panel is placed under the minimap (the old spot at
+       y=110 overlapped the minimap panel — "frames and grid disappeared"). */
+    int x0 = WIN_W - 10 - cols*cell, y0 = 158;
     RECT r = { x0, y0, x0 + cols*cell + 10, y0 + ((INV_CAP + cols - 1)/cols)*cell + 34 };
     HBRUSH br;
     g_invGridN = 0;
@@ -2125,8 +2247,10 @@ static void DrawAbilityGlyph(HDC hdc, RECT r, int slot)
 }
 static void PaintAbilityBar(HDC hdc)
 {
-    int bw = 52, gap = 6, total = NABILITY*bw + (NABILITY-1)*gap;
-    int x = WIN_W/2 - total/2, y = WIN_H - 74;
+    /* v0.27: smaller cells (44px), lifted above the XP strip (strip occupies
+       WIN_H-30..WIN_H, so bar bottom sits at WIN_H-40 with a 10px gap). */
+    int bw = 44, gap = 5, total = NABILITY*bw + (NABILITY-1)*gap;
+    int x = WIN_W/2 - total/2, y = WIN_H - 40 - bw;
     int i;
     ULONGLONG now = GetTickCount64();
     for (i = 0; i < NABILITY; i++) {
@@ -2139,18 +2263,15 @@ static void PaintAbilityBar(HDC hdc)
         FillRect(hdc, &r, br); DeleteObject(br);
         DrawFrameAt(hdc, r, RGB(0xC8,0x9A,0x3E));
         SafeWfmt(b, 64, L"%d", i+1);
-        TextL(hdc, r.left + 3, r.top + 1, b, RGB(0xE8,0xC8,0x5A), g_fSmall);
-        /* v0.23: icon glyph in the middle, short tag under it, cooldown count
-           in the bottom-right corner (MMO-style) */
-        DrawAbilityGlyph(hdc, r, i);
-        if (a->tag[0]) {
-            SafeWfmt(b, 64, L"%ls", a->tag);
-            TextC(hdc, (r.left+r.right)/2, r.bottom - 14, b, RGB(0xFF,0xFF,0xFF), g_fSmall, 1);
-        }
+        TextL(hdc, r.left + 2, r.top + 1, b, RGB(0xE8,0xC8,0x5A), g_fSmall);
+        /* v0.23: icon glyph in the middle; cooldown count in the bottom-right
+           corner (MMO-style). v0.27: tag text removed — glyphs are compact. */
+        { RECT gr = { r.left + 4, r.top + 6, r.right - 4, r.bottom - 4 };
+          DrawAbilityGlyph(hdc, gr, i); }
         if (a->readyAt > now) {
             int secs = (int)((a->readyAt - now + 999) / 1000);
             SafeWfmt(b, 64, L"%d", secs);
-            TextL(hdc, r.right - 14, r.bottom - 15, b, RGB(0xFF,0xE9,0x7A), g_fSmall);
+            TextR(hdc, r.right - 3, r.bottom - 14, b, RGB(0xFF,0xE9,0x7A), g_fSmall);
         }
         if (cdLeft > 0.0) {
             HBRUSH dim = CreateSolidBrush(RGB(0x08,0x0A,0x10));
@@ -2176,9 +2297,12 @@ static RECT g_mContinue, g_mQuit;
 static RECT g_shopRects[2];
 static void PaintMenuButton(HDC hdc)
 {
+    /* v0.27: the button used to sit at WIN_H-40 and overlapped the ability
+       bar after it was lifted above the XP strip — move it into the top HUD
+       band (right of centre, left of the minimap). */
     int bw = 96, bh = 30;
-    g_menuRect.left = WIN_W - bw - 10; g_menuRect.top = WIN_H - bh - 10;
-    g_menuRect.right = WIN_W - 10;     g_menuRect.bottom = WIN_H - 10;
+    g_menuRect.left = WIN_W/2 + 150; g_menuRect.top = 8;
+    g_menuRect.right = g_menuRect.left + bw; g_menuRect.bottom = 8 + bh;
     HBRUSH br = CreateSolidBrush(RGB(0x18,0x1C,0x2A));
     FillRect(hdc, &g_menuRect, br); DeleteObject(br);
     DrawFrameAt(hdc, g_menuRect, RGB(0xC8,0x9A,0x3E));
@@ -3579,9 +3703,9 @@ static LONG WINAPI TopLevelFilter(EXCEPTION_POINTERS* ep)
     h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
         SetFilePointer(h, 0, NULL, FILE_END);   /* append: keep the whole history */
-        /* build "YAV prototype v0.24: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
+        /* build "YAV prototype v0.27: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
            using only string APIs — no msvcrt printf anywhere in this path */
-        lstrcpyW(line, L"YAV prototype v0.24: exception 0x");
+        lstrcpyW(line, L"YAV prototype v0.27: exception 0x");
         WcAppendHex(line, code, 8);
         lstrcatW(line, L" at 0x");
         WcAppendHex(line, addr, 16);
@@ -3867,6 +3991,16 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                             return 0;
                         }
                     }
+                    /* v0.27: clicking a bag cell in the sheet equips/drinks */
+                    for (ci = 0; ci < g_charBagN; ci++) {
+                        RECT br2 = g_charBagRects[ci];
+                        if (br2.right > br2.left && mx0 >= br2.left && mx0 < br2.right &&
+                            my0 >= br2.top && my0 < br2.bottom) {
+                            if (g_inv[ci].id) InvSlotAction(hwnd, ci);
+                            InvalidateRect(hwnd, NULL, FALSE);
+                            return 0;
+                        }
+                    }
                     return 0;   /* clicks elsewhere in the sheet are inert */
                 }
                 /* v0.7: single click on an inventory slot equips/drinks too */
@@ -3977,6 +4111,12 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     memset(g_inv, 0, sizeof(g_inv));
                     memset(g_acorns_arr, 0, sizeof(g_acorns_arr));
                     g_lootMetal = 0; g_lootCloth = 0;
+                    /* v0.27: the fresh profile MUST carry quest=1 (greeted) and
+                       "acornTaken":[0,0,0]. Without these keys an older loader
+                       defaulted quest to 2 with a stale taken-array — which is
+                       exactly why acorns did not appear until a restart. */
+                    { const char* keep = NULL; (void)keep; }
+                    g_groshi = 0; g_xp = 0; g_profReady = 0;
                     g_px = 512; g_py = 470;
                     hasProfile = 1;
                     SaveProfile(); /* real-time: character creation persists now */
@@ -4011,6 +4151,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             DestroyWindow(hwnd);
             return 0;
         case WM_DESTROY:
+    SpritesFree();
             KillTimer(hwnd, 1);
             KillTimer(hwnd, 3);
             if (g_udpSock != INVALID_SOCKET) { closesocket(g_udpSock); g_udpSock = INVALID_SOCKET; WSACleanup(); }
@@ -4041,6 +4182,7 @@ int WINAPI WinMain(HINSTANCE hi, HINSTANCE ph, LPSTR cl, int cs)
     MSG m;
 
     SetUnhandledExceptionFilter(TopLevelFilter);  /* v0.8: no silent crash-exit */
+    SpritesInit();   /* v0.27: PNG sprites from sprites/items/ */
     RECT rc = {0, 0, WIN_W, WIN_H};
     DWORD style = WS_OVERLAPPEDWINDOW & ~(WS_THICKFRAME | WS_MAXIMIZEBOX);
     int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);

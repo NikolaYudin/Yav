@@ -535,6 +535,43 @@ static void ProfilePathW(wchar_t* out, size_t cch)
     dot = wcsrchr(out, L'.');
     if (dot) wcscpy(dot, L"_profile.json");
     else     wcscat(out, L"_profile.json");
+    /* BUGFIX v0.22: two windows launched from the SAME exe used to share one
+       profile file — every autosave from window #2 overwrote window #1's
+       world state (acorn flags included), so the second hero saw an empty
+       oak after taking the cat's task. Each process now gets its own file:
+       the first instance keeps "..._profile.json", further instances of the
+       same executable get "..._profile.2.json", ".3" and so on (tracked via
+       a named mutex). This mirrors the future server model where every
+       player has his OWN save slot / DB row. */
+    {
+        static int s_slotResolved = 0;
+        static HANDLE s_mutexes[8];
+        static int s_mutexCount = 0;
+        if (!s_slotResolved) {
+            wchar_t base[MAX_PATH], tag[64];
+            int k;
+            DWORD crc = 0xffffffffu; const wchar_t* q;
+            lstrcpynW(base, out, MAX_PATH);
+            /* deterministic name per exe path so ALL instances of this exe
+               contend for the same slots (slot #1 = plain _profile.json) */
+            for (q = base; *q; q++) crc = (crc << 5) ^ (crc >> 27) ^ (DWORD)*q;
+            for (k = 1; k <= 8; k++) {
+                HANDLE h;
+                wsprintfW(tag, L"Local\\YavProf%08X_%d", (unsigned)crc, k);
+                h = CreateMutexW(NULL, FALSE, tag);
+                if (h && WaitForSingleObject(h, 0) == WAIT_OBJECT_0) {
+                    s_mutexes[s_mutexCount++] = h;   /* keep it open for our lifetime */
+                    if (k >= 2) {                    /* slot 1 busy => suffix the file */
+                        wchar_t* d2 = wcsrchr(out, L'.');
+                        if (d2) wsprintfW(d2, L".%d_profile.json", k);
+                    }
+                    break;
+                }
+                if (h) CloseHandle(h);
+            }
+            s_slotResolved = 1;
+        }
+    }
 }
 
 /* Atomic save: write temp then MoveFileEx replace => never corrupts on crash */
@@ -1844,7 +1881,7 @@ static void PaintWorld(HDC hdc)
         Ellipse(hdc, fx - 26, fy - 24, fx + 26, fy + 24);
         SelectObject(hdc, fo); SelectObject(hdc, fb); DeleteObject(fp);
     }
-    /* v0.21: quest-state speech bubble above every NPC head.
+    /* v0.22: quest-state speech bubble above every NPC head.
        state 0 — available task: golden pulsing bubble with a quill;
        state 1 — quest taken & in progress: same bubble drawn GRAY (dimmed),
                  so it is obvious there is nothing to hand in yet;
@@ -2151,13 +2188,29 @@ static void PickNearbyResource(HWND hwnd)
     InvalidateRect(hwnd, NULL, FALSE);
 }
 
+static int CountTakenAcorns(void)
+{
+    int i, n = 0;
+    for (i = 0; i < 3; i++) if (g_acorns_arr[i].taken) n++;
+    return n;
+}
+
 /* v0.6: acorns respawn under the oak after they've all been handed over
    (or after an old save wiped them) so the world never looks empty. */
 static void RespawnAcorns(void)
 {
     int i, allTaken = 1;
     for (i = 0; i < 3; i++) if (!g_acorns_arr[i].taken) { allTaken = 0; break; }
-    if (allTaken) memset(g_acorns_arr, 0, sizeof(g_acorns_arr));
+    /* BUGFIX v0.22: "all taken" used to mean only "all three collected".
+       When two windows shared one profile file, window #2 saved its own
+       acorn flags on top of window #1's and the second hero saw a fully
+       picked oak (three stale taken-flags from the other player). Now we
+       also respawn when fewer acorns are flagged taken than the bag holds
+       already — physically impossible for one hero, so it can only mean
+       foreign state. The oak restocks => both players always find their
+       own acorns right after taking the cat's task. */
+    if (allTaken || (g_quest == 2 && g_acorns != CountTakenAcorns()))
+        memset(g_acorns_arr, 0, sizeof(g_acorns_arr));
 }
 
 /* v0.7: 5-second quest-completion popup (top-center, above the HUD strip) */
@@ -2873,9 +2926,9 @@ static LONG WINAPI TopLevelFilter(EXCEPTION_POINTERS* ep)
     h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
         SetFilePointer(h, 0, NULL, FILE_END);   /* append: keep the whole history */
-        /* build "YAV prototype v0.21: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
+        /* build "YAV prototype v0.22: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
            using only string APIs — no msvcrt printf anywhere in this path */
-        lstrcpyW(line, L"YAV prototype v0.21: exception 0x");
+        lstrcpyW(line, L"YAV prototype v0.22: exception 0x");
         WcAppendHex(line, code, 8);
         lstrcatW(line, L" at 0x");
         WcAppendHex(line, addr, 16);
@@ -2945,7 +2998,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 case IDC_BTN_CONT:  txt = B_CONT;  bg = RGB(0x3A,0x6B,0x3F); break;
                 case IDC_BTN_NEW:   txt = B_NEW;   break;
                 case IDC_BTN_P0: case IDC_BTN_P1: case IDC_BTN_P2: {
-                    /* v0.21 FIX: the cards used to be transparent owner-draw
+                    /* v0.22 FIX: the cards used to be transparent owner-draw
                        buttons painted only with a flat dark brush — they sat
                        ON TOP of PaintProfession's artwork and hid it, so the
                        player saw three "empty squares". Now each button paints

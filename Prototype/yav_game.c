@@ -126,6 +126,9 @@ static void DrawFrameAt(HDC hdc, RECT r, COLORREF c);
 static void DrawCatExtras(HDC hdc);
 static void DrawVillageCatParts(HDC hdc);
 static void DrawHero(HDC hdc);
+/* v0.18: minimap + weapon emblems on the profession screen */
+static void PaintMinimap(HDC hdc);
+static void DrawItemIcon(HDC hdc, RECT ir, int id, COLORREF base);
 static void PaintLaunch(HWND hwnd, HDC hdc);
 static void PaintSelect(HWND hwnd, HDC hdc);
 static void ShowDialogTop(const wchar_t* text, ...);   /* v0.16: variadic-safe setter: formats %ls/%d templates from varargs, copies plain strings as-is */
@@ -189,9 +192,17 @@ static int  g_energyCur = 60, g_energyMax = 60;
 static ULONGLONG g_buffUntil = 0;             /* damage buff expiry */
 static ULONGLONG g_lastRegen = 0;             /* passive energy regen tick */
 
+/* v0.18: world-coordinate offsets for the village (the big map was added in
+   v0.17; these two defines are needed before any table that stores WORLD
+   positions, e.g. the acorns below). Full block with camera + NPC positions
+   lives further down. */
+#define OFF_X   512
+#define OFF_Y   384
+
 /* Acorns under the oak (fixed positions, respawn per session only) */
 typedef struct { int x, y, taken; } Acorn;
-static Acorn g_acorns_arr[3] = { {470,290,0}, {560,306,0}, {512,336,0} };
+/* v0.18: positions are in WORLD coords (village is centred at OFF_X/OFF_Y) */
+static Acorn g_acorns_arr[3] = { {470+OFF_X,290+OFF_Y,0}, {560+OFF_X,306+OFF_Y,0}, {512+OFF_X,336+OFF_Y,0} };
 
 /* ======================= v0.4: items, inventory, NPCs, quests ============ */
 enum { ITEM_ACORN=1, ITEM_METAL, ITEM_CLOTH, ITEM_POTION, ITEM_AMULET,
@@ -235,33 +246,34 @@ static int   g_focusKind = 0, g_focusId = 0;            /* 0 none,1 npc(id=cat/s
 static wchar_t g_focusName[64] = L"";
 static wchar_t g_speaker[64] = L"";   /* who said the current line */
 
-/* NPC positions */
-#define SMITH_X 260
-#define SMITH_Y 216
-#define MARYA_X 772
-#define MARYA_Y 214
-#define SPOT_X  860
-#define SPOT_Y  470
-
-#define WORLD_TOP 96
-#define OAK_X 512
-#define OAK_Y 250
-#define CAT_X 620
-#define CAT_Y 300
-
-/* v0.17: the world is BIGGER than the window — a virtual map WORLD_W x
+/* v0.17/v0.18: the world is BIGGER than the window — a virtual map WORLD_W x
    WORLD_H pixels with the village in its centre (top-left of the village
    sits at OFF_X/OFF_Y in world coords). The camera g_camX/g_camY follows
    the hero; PaintWorld offsets all drawing by it. Walking to the screen
    edge scrolls the view instead of hitting an invisible window wall.
-   Declared here so DrawHero/DrawCat/PaintWorld can use it directly. */
+   v0.18 FIX: these defines MUST come before every use of OFF_X/OFF_Y
+   (the acorn table below) — that ordering bug scattered the objects. */
 #define WORLD_W 2048
 #define WORLD_H 1536
-/* Village occupies the window-sized area at world coords OFF_X/OFF_Y. */
-#define OFF_X   512
-#define OFF_Y   384
+/* Village occupies the window-sized area at world coords OFF_X/OFF_Y.
+   (OFF_X/OFF_Y themselves are defined above, near the acorn table.) */
+#define WORLD_TOP 96
 #define VIEW_TOP WORLD_TOP                /* HUD strip at top of window */
 static int g_camX = 0, g_camY = 0;
+
+/* NPC positions — ALL in WORLD coordinates (village-local + OFF_*).
+   Previously logic used village-local numbers while drawing added OFF_*,
+   which made the cat/smith/Marya/acorns "run apart" from their sprites. */
+#define SMITH_X (260 + OFF_X)
+#define SMITH_Y (216 + OFF_Y)
+#define MARYA_X (772 + OFF_X)
+#define MARYA_Y (214 + OFF_Y)
+#define SPOT_X  (860 + OFF_X)
+#define SPOT_Y  (470 + OFF_Y)
+#define OAK_X   (512 + OFF_X)
+#define OAK_Y   (250 + OFF_Y)
+#define CAT_X   (620 + OFF_X)
+#define CAT_Y   (300 + OFF_Y)
 
 /* Collision test for a single point (shared by keyboard and mouse movement)
    v0.17: rewritten for world coordinates. Boundaries are now soft: they only
@@ -270,7 +282,8 @@ static int BlockedAt(int nx, int ny)
 {
     if (nx < 14 || nx > WORLD_W - 14) return 1;
     if (ny < VIEW_TOP + 14 || ny > WORLD_H - 40) return 1;
-    if (abs(nx - (OAK_X + OFF_X)) < 16 && ny > OAK_Y + OFF_Y && ny < OAK_Y + OFF_Y + 50) return 1; /* oak trunk */
+    /* v0.18: OAK_X/CAT_X/... are already WORLD coords — no extra OFF_* here */
+    if (abs(nx - OAK_X) < 16 && ny > OAK_Y && ny < OAK_Y + 50) return 1;           /* oak trunk */
     { int rx = 172 + OFF_X, ry = 116 + OFF_Y;
       if (nx >= rx && nx <= rx + 176 && ny >= ry && ny <= ry + 88) return 1; }                     /* smith hut */
     { int rx = 684 + OFF_X, ry = 116 + OFF_Y;
@@ -681,7 +694,7 @@ static int LoadProfile(void) /* returns 1 if a valid profile was loaded */
         if (g_px > WORLD_W-20) g_px = WORLD_W - 20;
         if (g_py < VIEW_TOP + 24) g_py = VIEW_TOP + 24;
         if (g_py > WORLD_H - 90)     g_py = WORLD_H - 90;
-        if (BlockedAt(g_px, g_py)) { g_px = OAK_X + OFF_X; g_py = 470 + OFF_Y; } /* spawn fallback */
+        if (BlockedAt(g_px, g_py)) { g_px = OAK_X; g_py = 470 + OFF_Y; } /* spawn fallback */
         g_questStep  = JsonGetInt(buf, "step", 0);
         g_quest      = JsonGetInt(buf, "q", 0);
         g_acorns     = JsonGetInt(buf, "acorns", 0);
@@ -913,9 +926,15 @@ static void DrawCatExtras(HDC hdc)
 
 static void DrawHero(HDC hdc)
 {
-    COLORREF col = (g_selected >= 0 && g_selected < NCLASS) ? g_class[g_selected].color : RGB(60,60,120);
-    /* v0.17: hero is drawn in world coords — offset by camera */
-    int sx = g_px - g_camX, sy = g_py - g_camY;
+    COLORREF col;
+    /* v0.18: hero is drawn in WORLD coords inside the camera transform —
+       previously it was converted to screen coords manually, so with the
+       camera applied it appeared twice as far from its true position. */
+    int sx = g_px, sy = g_py;
+    if (g_youngster || g_selected < 0 || g_selected >= NCLASS)
+        col = RGB(0x4A,0x5A,0x7A);            /* молодец — серый кафтан */
+    else
+        col = g_class[g_selected].color;
     /* shadow */
     FillEllipse(hdc, sx, sy + 14, 10, 4, RGB(0x40,0x55,0x35));
     /* body */
@@ -923,6 +942,94 @@ static void DrawHero(HDC hdc)
     /* head */
     FillCircle(hdc, sx, sy - 14, 7, RGB(0xE8,0xC8,0x9A));
     TextC(hdc, sx, sy + 20, g_nick, RGB(0xFF,0xFF,0xFF), g_fSmall, 1);
+}
+
+/* v0.18: minimap for the big world (top-right corner of the window).
+   Scale: MM_W x MM_H pixels for a WORLD_W x WORLD_H map. Static parts
+   (village fence + surroundings tint) are cached in a memory bitmap and
+   re-blitted every frame; only the moving dots (hero, NPCs, acorns, loot,
+   current view rectangle) are redrawn live — cheap even on weak PCs. */
+#define MM_W 160
+#define MM_H 120
+static HBITMAP g_mmBase = NULL;
+static HDC     g_mmBaseDC = NULL;
+
+static void MinimapBuildBase(void)
+{
+    BITMAPINFO bi; HDC mdc; HBITMAP old = NULL; RECT r; HPEN p;
+    if (g_mmBase) return;
+    memset(&bi, 0, sizeof(bi));
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = MM_W; bi.bmiHeader.biHeight = -MM_H;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    g_mmBase = CreateDIBSection(NULL, &bi, DIB_RGB_COLORS, NULL, NULL, 0);
+    if (!g_mmBase) return;
+    mdc = CreateCompatibleDC(NULL);
+    old = (HBITMAP)SelectObject(mdc, g_mmBase);
+    { HBRUSH b = CreateSolidBrush(RGB(0x10,0x1A,0x12));
+      RECT full = { 0, 0, MM_W, MM_H }; FillRect(mdc, &full, b); DeleteObject(b); }
+    /* village floor block */
+    { HBRUSH b = CreateSolidBrush(RGB(0x27,0x3A,0x2B));
+      r.left = OFF_X * MM_W / WORLD_W;  r.top = OFF_Y * MM_H / WORLD_H;
+      r.right = (OFF_X + WIN_W) * MM_W / WORLD_W; r.bottom = (OFF_Y + WIN_H) * MM_H / WORLD_H;
+      FillRect(mdc, &r, b); DeleteObject(b); }
+    /* road through the village */
+    { HBRUSH b = CreateSolidBrush(RGB(0x46,0x3E,0x30));
+      r.left = OFF_X * MM_W / WORLD_W;  r.top = (OFF_Y + 300) * MM_H / WORLD_H;
+      r.right = (OFF_X + WIN_W) * MM_W / WORLD_W; r.bottom = (OFF_Y + 360) * MM_H / WORLD_H;
+      FillRect(mdc, &r, b); DeleteObject(b); }
+    /* fence outline */
+    p = CreatePen(PS_SOLID, 1, RGB(0x8A,0x74,0x44));
+    { HPEN o = (HPEN)SelectObject(mdc, p);
+      SelectObject(mdc, GetStockObject(NULL_BRUSH));
+      Rectangle(mdc, OFF_X * MM_W / WORLD_W, (OFF_Y + WORLD_TOP) * MM_H / WORLD_H,
+                (OFF_X + WIN_W) * MM_W / WORLD_W, (OFF_Y + WIN_H) * MM_H / WORLD_H);
+      SelectObject(mdc, o); }
+    DeleteObject(p);
+    SelectObject(mdc, old);
+    g_mmBaseDC = mdc;   /* keep the DC: blit source next to the bitmap */
+}
+
+static void PaintMinimap(HDC hdc)
+{
+    int rx = WIN_W - MM_W - 10, ry = 10;
+    RECT dst = { rx, ry, rx + MM_W, ry + MM_H };
+    int vx = g_camX * MM_W / WORLD_W, vy = g_camY * MM_H / WORLD_H;
+    int vw = WIN_W * MM_W / WORLD_W, vh = WIN_H * MM_H / WORLD_H;
+    HPEN wp;
+    wchar_t b[64];
+    MinimapBuildBase();
+    /* panel + cached base */
+    RectFill(hdc, rx - 4, ry - 4, MM_W + 8, MM_H + 22, RGB(0x0C,0x10,0x18));
+    if (g_mmBaseDC) BitBlt(hdc, rx, ry, MM_W, MM_H, g_mmBaseDC, 0, 0, SRCCOPY);
+    else RectFill(hdc, rx, ry, MM_W, MM_H, RGB(0x16,0x24,0x19));
+    /* static points: oak, smith, marya, grove spot */
+    FillCircle(hdc, rx + OAK_X * MM_W / WORLD_W,   ry + OAK_Y * MM_H / WORLD_H,   2, RGB(0x3A,0x7A,0x3A));
+    FillCircle(hdc, rx + SMITH_X * MM_W / WORLD_W, ry + SMITH_Y * MM_H / WORLD_H, 2, RGB(0xC0,0x60,0x30));
+    FillCircle(hdc, rx + MARYA_X * MM_W / WORLD_W, ry + MARYA_Y * MM_H / WORLD_H, 2, RGB(0x60,0x90,0xC0));
+    if (!g_lootMetal || !g_lootCloth)
+        FillCircle(hdc, rx + SPOT_X * MM_W / WORLD_W, ry + SPOT_Y * MM_H / WORLD_H, 2, RGB(0xE0,0xB0,0x40));
+    /* cat (moves never — but he is an NPC worth marking) */
+    FillCircle(hdc, rx + CAT_X * MM_W / WORLD_W, ry + CAT_Y * MM_H / WORLD_H, 2, RGB(0xF2,0xE7,0xC8));
+    /* loose acorns */
+    { int i;
+      for (i = 0; i < 3; i++) if (!g_acorns_arr[i].taken)
+          FillCircle(hdc, rx + g_acorns_arr[i].x * MM_W / WORLD_W,
+                        ry + g_acorns_arr[i].y * MM_H / WORLD_H, 1, RGB(0xC8,0x8A,0x3E)); }
+    /* hero — bright dot */
+    FillCircle(hdc, rx + g_px * MM_W / WORLD_W, ry + g_py * MM_H / WORLD_H, 3, RGB(0xFF,0xF3,0x60));
+    /* current view rectangle */
+    wp = CreatePen(PS_SOLID, 1, RGB(0xC8,0x9A,0x3E));
+    { HPEN o = (HPEN)SelectObject(hdc, wp);
+      SelectObject(hdc, GetStockObject(NULL_BRUSH));
+      Rectangle(hdc, rx + vx, ry + vy, rx + vx + vw, ry + vy + vh);
+      SelectObject(hdc, o); }
+    DeleteObject(wp);
+    /* frame + caption */
+    DrawFrameAt(hdc, dst, RGB(0xC8,0x9A,0x3E));
+    SafeWfmt(b, 64, L"%d,%d", g_px, g_py);
+    TextC(hdc, rx + MM_W/2, ry + MM_H + 6, b, RGB(0x9A,0xAA,0xC0), g_fSmall, 1);
 }
 
 static void DrawDialogBox(HDC hdc)
@@ -1227,7 +1334,14 @@ static void PaintProfession(HWND hwnd, HDC hdc)
         int ly = y + 104;
         FillRect(hdc, &cr, b); DeleteObject(b);
         DrawFrameAt(hdc, cr, cols[i]);
-        FillCircle(hdc, x + w/2, y + 40, 24, cols[i]);
+        /* v0.18: weapon emblem instead of the empty colored circle —
+           Воин = булава, Лучник = лук, Волхв = посох (same icons as in
+           the inventory, so the player sees which gear each path gives). */
+        { RECT ir = { x + w/2 - 24, y + 16, x + w/2 + 24, y + 64 };
+          int wid = i == 0 ? ITEM_BULAVA : i == 1 ? ITEM_LUKO : ITEM_POSOH;
+          const ItemDef* wd = Item(wid);
+          FillCircle(hdc, x + w/2, y + 40, 28, RGB(0x10,0x14,0x20));
+          DrawItemIcon(hdc, ir, wid, wd ? wd->col : cols[i]); }
         TextC(hdc, x + w/2, y + 76, names[i], RGB(0xFF,0xF3,0xC0), g_fMed, 1);
         while (*s && ly < y + h - 34) {
             wchar_t line[32]; int n = 0;
@@ -1605,19 +1719,22 @@ static void PaintWorld(HDC hdc)
                 DeleteObject(br);
             }
     }
-    /* village floor patch (the original 1024x672 yard) */
-    RectFill(hdc, OFF_X, OFF_Y + WORLD_TOP - OFF_Y, WIN_W, WIN_H - WORLD_TOP, RGB(0x1B,0x2A,0x1E));
-    /* fence line around the village (world coords) */
-    pen = CreatePen(PS_SOLID, 2, RGB(0x6A,0x5A,0x3A));
-    { HPEN o = (HPEN)SelectObject(hdc, pen);
-      MoveToEx(hdc, OFF_X + 14, OFF_X == 0 ? 0 : 0, NULL); (void)o;
-      SelectObject(hdc, o); }
-    DeleteObject(pen);
-    /* road */
+    /* v0.18 FIX: village floor patch — a full window-sized yard starting at
+       the top HUD line (OFF_Y), NOT collapsed to a thin strip like before. */
+    RectFill(hdc, OFF_X, OFF_Y, WIN_W, WIN_H, RGB(0x1B,0x2A,0x1E));
+    /* fence palisade around the village footprint (world coords) */
+    { HPEN fp = CreatePen(PS_SOLID, 2, RGB(0x6A,0x5A,0x3A));
+      HPEN fo = (HPEN)SelectObject(hdc, fp);
+      SelectObject(hdc, GetStockObject(NULL_BRUSH));
+      Rectangle(hdc, OFF_X + 14, OFF_Y + WORLD_TOP, OFF_X + WIN_W - 14, OFF_Y + WIN_H - 40);
+      SelectObject(hdc, fo); DeleteObject(fp); }
+    /* road across the village */
     RectFill(hdc, OFF_X, OFF_Y + 300, WIN_W, 60, RGB(0x3A,0x34,0x2A));
-    /* huts: smith (left) and marya (right) */
+    /* huts: smith (left) and marya (right). SMITH_X/MARYA_X are already
+       WORLD coords — the old code added OFF_X a second time, which pushed
+       every object off-screen ("объекты разбежались"). */
     for (i = 0; i < 2; i++) {
-        int hx = (i == 0 ? SMITH_X - 66 : MARYA_X - 66) + OFF_X;
+        int hx = (i == 0 ? SMITH_X - 66 : MARYA_X - 66);
         RECT hr = { hx, OFF_Y + 116, hx + 132, OFF_Y + 204 };
         br = CreateSolidBrush(RGB(0x6A,0x4A,0x2A));
         FillRect(hdc, &hr, br); DeleteObject(br);
@@ -1636,12 +1753,12 @@ static void PaintWorld(HDC hdc)
         TextC(hdc, (hr.left+hr.right)/2, hr.bottom + 4,
               i == 0 ? NPC_SMITH : NPC_MARYA, RGB(0xC8,0xC8,0xD8), g_fSmall, 1);
     }
-    /* oak */
+    /* oak (OAK_X/OAK_Y are WORLD coords — no extra OFF_* offset) */
     br = CreateSolidBrush(RGB(0x5A,0x3A,0x20));
-    { RECT trunk = { OAK_X + OFF_X - 12, OAK_Y + OFF_Y + 10, OAK_X + OFF_X + 12, OAK_Y + OFF_Y + 60 }; FillRect(hdc, &trunk, br); }
+    { RECT trunk = { OAK_X - 12, OAK_Y + 10, OAK_X + 12, OAK_Y + 60 }; FillRect(hdc, &trunk, br); }
     DeleteObject(br);
-    FillEllipse(hdc, OAK_X + OFF_X, OAK_Y + OFF_Y - 14, 52, 38, RGB(0x2A,0x5A,0x2A));
-    TextC(hdc, OAK_X + OFF_X, OAK_Y + OFF_Y + 62, T_OAK, RGB(0xC8,0xC8,0xD8), g_fSmall, 1);
+    FillEllipse(hdc, OAK_X, OAK_Y - 14, 52, 38, RGB(0x2A,0x5A,0x2A));
+    TextC(hdc, OAK_X, OAK_Y + 62, T_OAK, RGB(0xC8,0xC8,0xD8), g_fSmall, 1);
     /* dark grove spot (v0.7: shows remaining loot) */
     PaintGroveSpot(hdc);
     /* v0.17: movement grid over the WHOLE world (not just one screenful) */
@@ -1678,8 +1795,8 @@ static void PaintWorld(HDC hdc)
     /* acorns: small nut with cap (matches the IT_ACORN icon color) */
     for (i = 0; i < 3; i++) {
         if (g_acorns_arr[i].taken) continue;
-        FillCircle(hdc, g_acorns_arr[i].x + OFF_X, g_acorns_arr[i].y + OFF_Y, 6, RGB(0xC8,0x8A,0x3E));
-        FillEllipse(hdc, g_acorns_arr[i].x + OFF_X, g_acorns_arr[i].y + OFF_Y - 5, 7, 4, RGB(0x6B,0x4A,0x24));
+        FillCircle(hdc, g_acorns_arr[i].x, g_acorns_arr[i].y, 6, RGB(0xC8,0x8A,0x3E));
+        FillEllipse(hdc, g_acorns_arr[i].x, g_acorns_arr[i].y - 5, 7, 4, RGB(0x6B,0x4A,0x24));
     }
     /* cat body + spectacles + scroll (Kot Ucheny) */
     DrawVillageCatParts(hdc);
@@ -1718,6 +1835,7 @@ static void PaintWorld(HDC hdc)
     }
     /* HUD layers */
     PaintPlayerPanel(hdc);
+    PaintMinimap(hdc);      /* v0.18: big-world minimap, top-right corner */
     PaintFocusInfo(hdc);
     PaintAbilityBar(hdc);
     PaintInventory(hdc);
@@ -1985,7 +2103,7 @@ int main(void)
     memset(g_inv, 0, sizeof(g_inv));
     memset(g_acorns_arr, 0, sizeof(g_acorns_arr));
     g_lootMetal = 0; g_lootCloth = 0;
-    g_px = OAK_X + OFF_X; g_py = 470 + OFF_Y;
+    g_px = OAK_X; g_py = 470 + OFF_Y;
     SaveProfile();
     printf("[ok] created + saved profile\n");
 
@@ -2296,6 +2414,10 @@ static void ChooseProfession(HWND hwnd, int idx)
     g_selected = idx;                    /* hotbar follows the profession */
     g_profBonus = 5;
     g_youngster = 0;
+    /* v0.18: profession maps onto the matching class archetype so that the
+       hero color and per-class abilities light up (Воин->Богатырь,
+       Лучник->Стрелок, Волхв->Волхв). */
+    if (g_selected < 0 || g_selected >= NCLASS) g_selected = 0;
     g_level++;
     g_hpMax += 20; g_hpCur = g_hpMax;    /* level-up heal */
     g_energyMax += 5; g_energyCur = g_energyMax;
@@ -2486,7 +2608,7 @@ static void WcAppendHex(wchar_t* out, unsigned long long v, int digits)
 
 static LONG WINAPI TopLevelFilter(EXCEPTION_POINTERS* ep)
 {
-    wchar_t path[MAX_PATH], line[256];
+    wchar_t path[MAX_PATH], line[512];
     DWORD wr;
     HANDLE h;
     unsigned long long code = ep && ep->ExceptionRecord
@@ -2499,9 +2621,9 @@ static LONG WINAPI TopLevelFilter(EXCEPTION_POINTERS* ep)
     h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
         SetFilePointer(h, 0, NULL, FILE_END);   /* append: keep the whole history */
-        /* build "YAV prototype v0.17: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
+        /* build "YAV prototype v0.18: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
            using only string APIs — no msvcrt printf anywhere in this path */
-        lstrcpyW(line, L"YAV prototype v0.17: exception 0x");
+        lstrcpyW(line, L"YAV prototype v0.18: exception 0x");
         WcAppendHex(line, code, 8);
         lstrcatW(line, L" at 0x");
         WcAppendHex(line, addr, 16);
@@ -2825,6 +2947,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             return 0;
         case WM_DESTROY:
             KillTimer(hwnd, 1);
+            /* v0.18: release the cached minimap bitmap/DC */
+            if (g_mmBaseDC) { DeleteDC(g_mmBaseDC); g_mmBaseDC = NULL; }
+            if (g_mmBase)   { DeleteObject(g_mmBase);   g_mmBase = NULL; }
             PostQuitMessage(0);
             return 0;
     }

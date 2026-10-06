@@ -1844,6 +1844,58 @@ static void PaintWorld(HDC hdc)
         Ellipse(hdc, fx - 26, fy - 24, fx + 26, fy + 24);
         SelectObject(hdc, fo); SelectObject(hdc, fb); DeleteObject(fp);
     }
+    /* v0.21: quest-state speech bubble above every NPC head.
+       state 0 — available task: golden pulsing bubble with a quill;
+       state 1 — quest taken & in progress: same bubble drawn GRAY (dimmed),
+                 so it is obvious there is nothing to hand in yet;
+       state 2 — done: no bubble at all. */
+    {
+        int st_cat = 0, st_sm = 0, st_ma = 0, k;
+        /* cat: offers tasks 1..3 until the path is chosen */
+        if      (g_quest >= 6)                        st_cat = 2;
+        else if (g_quest >= 1 && (g_smithStage || g_maryaStage)) st_cat = 1;
+        /* smith: needs ore (quest 2/3+) -> available; crafting -> gray; done -> none */
+        if      (g_smithStage >= 3)                   st_sm = 2;
+        else if (g_smithStage == 1 || g_smithStage == 2) st_sm = 1;
+        else if (g_quest >= 2)                        st_sm = 0;
+        /* marya: same logic with cloth */
+        if      (g_maryaStage >= 3)                   st_ma = 2;
+        else if (g_maryaStage == 1 || g_maryaStage == 2) st_ma = 1;
+        else if (g_smithStage >= 3 && g_quest >= 4)   st_ma = 0;
+        for (k = 0; k < 3; k++) {
+            int nx, ny, st = (k == 0 ? st_cat : k == 1 ? st_sm : st_ma);
+            COLORREF bgc, frmc, tcol;
+            wchar_t qi[8];
+            if (st != 0 && st != 1) continue;
+            nx = (k == 0 ? CAT_X   : k == 1 ? SMITH_X : MARYA_X);
+            ny = (k == 0 ? CAT_Y-46: k == 1 ? SMITH_Y-118 : MARYA_Y-118);
+            if (st == 0) {
+                double pulse = 0.55 + 0.45 * fabs(sin((double)(GetTickCount() % 2000) / 2000.0 * 3.14159));
+                bgc  = RGB((int)(0xE8*pulse)+0x30, (int)(0xC8*pulse)+0x20, 0x3A);
+                frmc = RGB(0xFF,0xF3,0xC0); tcol = RGB(0x2A,0x1E,0x08);
+            } else {     /* grayed-out: quest already given / in progress */
+                bgc  = RGB(0x5A,0x60,0x6C); frmc = RGB(0x8A,0x90,0x9C); tcol = RGB(0x30,0x34,0x3C);
+            }
+            SafeWfmt(qi, 8, L"%d", k == 0 ? 1 : k == 1 ? 2 : 3);
+            FillCircle(hdc, nx, ny, 11, bgc);
+            { RECT tri = { nx - 6, ny + 8, nx + 6, ny + 18 };
+              POINT pp[3]; HBRUSH tb = CreateSolidBrush(bgc);
+              pp[0].x = tri.left; pp[0].y = tri.top; pp[1].x = tri.right; pp[1].y = tri.top;
+              pp[2].x = nx; pp[2].y = tri.bottom;
+              { HPEN o = (HPEN)SelectObject(hdc, GetStockObject(NULL_PEN));
+                Polygon(hdc, pp, 3); SelectObject(hdc, o); }
+              DeleteObject(tb); }
+            pen = CreatePen(PS_SOLID, 2, frmc);
+            { HPEN o = (HPEN)SelectObject(hdc, pen);
+              HBRUSH ob = (HBRUSH)SelectObject(hdc, GetStockObject(NULL_BRUSH));
+              Ellipse(hdc, nx - 11, ny - 11, nx + 11, ny + 11);
+              MoveToEx(hdc, nx - 4, ny + 1, NULL); LineTo(hdc, nx + 4, ny - 5);  /* quill stroke */
+              SelectObject(hdc, o); SelectObject(hdc, ob); }
+            DeleteObject(pen);
+            TextC(hdc, nx + 16, ny - 6, qi, st == 0 ? RGB(0xFF,0xE9,0x7A) : RGB(0x77,0x7E,0x8A), g_fSmall, 0);
+            (void)tcol;
+        }
+    }
     /* v0.19: the old "hint above player" block drew its text in WORLD coords
        while the camera transform was already reset — with a panned camera the
        hint appeared hundreds of px away from the hero (part of the "карта
@@ -2821,9 +2873,9 @@ static LONG WINAPI TopLevelFilter(EXCEPTION_POINTERS* ep)
     h = CreateFileW(path, GENERIC_WRITE, FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
     if (h != INVALID_HANDLE_VALUE) {
         SetFilePointer(h, 0, NULL, FILE_END);   /* append: keep the whole history */
-        /* build "YAV prototype v0.20: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
+        /* build "YAV prototype v0.21: exception 0xXXXXXXXX at 0xXXXXXXXXXXXXXXXX (fault #N)"
            using only string APIs — no msvcrt printf anywhere in this path */
-        lstrcpyW(line, L"YAV prototype v0.20: exception 0x");
+        lstrcpyW(line, L"YAV prototype v0.21: exception 0x");
         WcAppendHex(line, code, 8);
         lstrcatW(line, L" at 0x");
         WcAppendHex(line, addr, 16);
@@ -2893,9 +2945,45 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                 case IDC_BTN_CONT:  txt = B_CONT;  bg = RGB(0x3A,0x6B,0x3F); break;
                 case IDC_BTN_NEW:   txt = B_NEW;   break;
                 case IDC_BTN_P0: case IDC_BTN_P1: case IDC_BTN_P2: {
+                    /* v0.21 FIX: the cards used to be transparent owner-draw
+                       buttons painted only with a flat dark brush — they sat
+                       ON TOP of PaintProfession's artwork and hid it, so the
+                       player saw three "empty squares". Now each button paints
+                       its own complete card (emblem + name + description +
+                       hotkey), matching the background layout exactly. */
+                    int idx = di->CtlID - IDC_BTN_P0;
                     RECT r = di->rcItem;
-                    HBRUSH b = CreateSolidBrush(di->itemState & ODS_SELECTED ? RGB(0x2A,0x34,0x50) : RGB(0x1A,0x1E,0x2C));
-                    FillRect(di->hDC, &r, b); DeleteObject(b);
+                    const COLORREF cols[3] = { RGB(0x2F,0x3A,0x8B), RGB(0x3A,0x6B,0x3F), RGB(0x7A,0x4A,0x4A) };
+                    const wchar_t* names[3]; const wchar_t* descs[3];
+                    const wchar_t* s; int ly;
+                    static const wchar_t* nm[3]; static const wchar_t* ds[3];
+                    if (!nm[0]) { nm[0]=PR_WARRIOR; nm[1]=PR_HUNTER; nm[2]=PR_MAGUS;
+                                  ds[0]=PD_WARRIOR; ds[1]=PD_HUNTER; ds[2]=PD_MAGUS; }
+                    names[0]=nm[0]; names[1]=nm[1]; names[2]=nm[2];
+                    descs[0]=ds[0]; descs[1]=ds[1]; descs[2]=ds[2];
+                    { HBRUSH b = CreateSolidBrush(di->itemState & ODS_SELECTED ? RGB(0x26,0x2C,0x40) : RGB(0x1A,0x1E,0x2C));
+                      FillRect(di->hDC, &r, b); DeleteObject(b); }
+                    DrawFrameAt(di->hDC, r, cols[idx]);
+                    SetBkMode(di->hDC, TRANSPARENT);
+                    { int cxp = (r.left + r.right)/2;
+                      RECT ir = { cxp - 24, r.top + 16, cxp + 24, r.top + 64 };
+                      int wid = idx == 0 ? ITEM_BULAVA : idx == 1 ? ITEM_LUKO : ITEM_POSOH;
+                      const ItemDef* wd = Item(wid);
+                      FillCircle(di->hDC, cxp, r.top + 40, 28, RGB(0x10,0x14,0x20));
+                      DrawItemIcon(di->hDC, ir, wid, wd ? wd->col : cols[idx]);
+                      TextC(di->hDC, cxp, r.top + 76, names[idx], RGB(0xFF,0xF3,0xC0), g_fMed, 1);
+                      s = descs[idx]; ly = r.top + 104;
+                      while (*s && ly < r.bottom - 34) {
+                          wchar_t line[32]; int n = 0;
+                          while (s[n] && n < 24) n++;
+                          if (s[n] && s[n] != L' ') { while (n > 0 && s[n-1] != L' ') n--; if (!n) n = 24; }
+                          wcsncpy(line, s, n); line[n] = 0;
+                          TextC(di->hDC, cxp, ly, line, RGB(0xC8,0xC8,0xD8), g_fSmall, 1);
+                          s += n; while (*s == L' ') s++;
+                          ly += 17;
+                      }
+                      { wchar_t kb[16]; SafeWfmt(kb, 16, L"[\x041a \x043b \x0430 \x0432. %d]", idx + 1);
+                        TextC(di->hDC, cxp, r.bottom - 26, kb, RGB(0xE8,0xC8,0x5A), g_fSmall, 1); } }
                     return TRUE; }
                 case IDC_CARD_0: case IDC_CARD_1: case IDC_CARD_2: {
                     int idx = di->CtlID - IDC_CARD_0;

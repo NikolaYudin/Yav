@@ -269,6 +269,11 @@ static int   g_charOpen = 0;
 static RECT  g_charRects[12];
 static int   g_charGridN = 0;
 static int   g_level = 1, g_profBonus = 0;              /* profession bonus */
+/* v0.25: experience bar + profession unlocks at level 5 */
+static int   g_xp = 0;
+static int   g_profReady = 0;               /* v0.25: LVL 5 reached -> stezha unlocked */
+static int   XpNeed(int lvl) { return 50 + (lvl - 1) * 30; }
+static void  AddXp(int amount);             /* forward decl (defined near Toast) */
 static int   g_prof = -1;                               /* v0.19: 0 Воин / 1 Лучник / 2 Волхв, -1 ещё не избрана */
 static int   g_youngster = 1;                           /* 1 = молодец, 0 = истый герой */
 /* v0.5: starter stats for the "молодец" (no class chosen at creation) */
@@ -700,7 +705,8 @@ static void SaveProfile(void)
             "  \"inventory\": %s,\n"
             "  \"acornTaken\": [%d, %d, %d],\n"
             "  \"loot\": [%d, %d],\n"
-            "  \"groshi\": %d\n"
+            "  \"groshi\": %d,\n"
+            "  \"xp\": %d\n"
             "}\n",
             stamp, nutf, g_selected, g_hpCur, g_hpMax, g_energyCur,
             g_level, g_profBonus, g_prof, g_youngster, g_px, g_py,
@@ -708,7 +714,7 @@ static void SaveProfile(void)
             g_smithStage, g_maryaStage,
             g_equipW, g_equipA, g_equipR, invJson,
             g_acorns_arr[0].taken, g_acorns_arr[1].taken, g_acorns_arr[2].taken,
-            g_lootMetal, g_lootCloth, g_groshi);
+            g_lootMetal, g_lootCloth, g_groshi, g_xp);
     }
     fclose(f);
 
@@ -821,6 +827,7 @@ static int LoadProfile(void) /* returns 1 if a valid profile was loaded */
         g_questStep  = JsonGetInt(buf, "step", 0);
         g_quest      = JsonGetInt(buf, "q", 0);
         g_acorns     = JsonGetInt(buf, "acorns", 0);
+        g_xp         = JsonGetInt(buf, "xp", 0);   /* v0.25 */
         g_smithStage = JsonGetInt(buf, "smith", 0);
         g_maryaStage = JsonGetInt(buf, "marya", 0);
         g_catTalked  = strstr(buf, "\"catTalked\": true") ? 1 : 0;
@@ -930,9 +937,29 @@ static void QuestCompleteToast(int n, int coins, const wchar_t* doneMsg)
 {
     wchar_t b[192];
     g_groshi += coins;
+    AddXp(25);
     SafeWfmt(b, 192, L"\x2726 %ls \x00b7 +%d \x0433\x0440\x043e\x0448\x0435\x0439", doneMsg, coins);
     Toast(b);
     SaveProfile();
+}
+
+/* v0.25: experience — fills the bottom XP bar; level-ups raise stats and at
+   LVL 5 unlock the profession choice (after the cat's three tasks). */
+static void AddXp(int amount)
+{
+    wchar_t b[96];
+    if (amount <= 0) return;
+    g_xp += amount;
+    while (g_xp >= XpNeed(g_level)) {
+        g_xp -= XpNeed(g_level);
+        g_level++;
+        g_hpMax += 10; g_hpCur = g_hpMax;
+        g_energyMax += 5; g_energyCur = g_energyMax;
+        SafeWfmt(b, 96, L"\x2726 \x041d\x043e\x0432\x044b\x0439 \x0443\x0440\x043e\x0432\x0435\x043d\x044c: %d!", g_level);
+        Toast(b);
+        if (g_level >= 5 && g_quest == 5 && g_youngster)
+            g_profReady = 1;   /* stezha unlocked: cat screen can open */
+    }
 }
 
 static int ShopBuy(HWND hwnd, int which)   /* 1 hp-potion, 2 energy-potion */
@@ -1923,19 +1950,26 @@ static void PaintCharWindow(HWND hwnd, HDC hdc)
           int cy = gy + (i / 3) * (cell + gap);
           RECT sr = { cx, cy, cx + cell, cy + cell };
           int eid = CharEquipIdForSlot(i);
+          int hovs = (g_mouseX >= cx && g_mouseX < cx + cell &&
+                      g_mouseY >= cy && g_mouseY < cy + cell);   /* v0.25 hover */
           g_charRects[g_charGridN++] = sr;
           br = CreateSolidBrush(eid ? RGB(0x2E,0x28,0x1E) : RGB(0x14,0x12,0x10));
           FillRect(hdc, &sr, br); DeleteObject(br);
-          DrawFrameAt(hdc, sr, eid ? RGB(0xC8,0x9A,0x3E) : RGB(0x4A,0x40,0x34));
+          DrawFrameAt(hdc, sr, hovs ? RGB(0xFF,0xE9,0x7A)
+                             : (eid ? RGB(0xC8,0x9A,0x3E) : RGB(0x4A,0x40,0x34)));
           if (eid) {
               RECT ir = { sr.left + 16, sr.top + 8, sr.right - 16, sr.bottom - 26 };
               DrawItemIcon(hdc, ir, eid, Item(eid)->col);
+              /* v0.25: gold "Н" badge in the lower-right corner marks the
+                 item as worn (надето). */
+              TextR(hdc, sr.right - 6, sr.bottom - 34, L"\x041d",
+                    RGB(0xFF,0xE9,0x7A), g_fSmall);
           }
           TextC(hdc, (sr.left+sr.right)/2, sr.bottom - 20, CharSlotName(i),
                 eid ? RGB(0xFF,0xF3,0xC0) : RGB(0x6A,0x62,0x58), g_fSmall, 1);
       }
     }
-    /* --- right column: resources/currency, 7 rows ----------------------- */
+    /* --- right column: the BAG (resources), 7 rows ----------------------- */
     { int rx = wx + 264, ry = wy + 132;
       struct { int id; const wchar_t* nm; int cnt; COLORREF col; } res[7];
       res[0].id = 0;           res[0].nm = L"\x0413\x0440\x043e\x0448\x0438"; res[0].cnt = g_groshi;             res[0].col = RGB(0xE0,0xB0,0x40);
@@ -1945,12 +1979,15 @@ static void PaintCharWindow(HWND hwnd, HDC hdc)
       res[4].id = ITEM_POTION; res[4].nm = IT_POTION; res[4].cnt = InvCount(ITEM_POTION); res[4].col = RGB(0x4A,0xA0,0x60);
       res[5].id = ITEM_POT_EN; res[5].nm = L"\x0417\x0435\x043b\x044c\x0435 \x0441\x0438\x043b\x044b"; res[5].cnt = InvCount(ITEM_POT_EN); res[5].col = RGB(0x4A,0x8A,0xE0);
       res[6].id = ITEM_AMULET; res[6].nm = IT_AMULET; res[6].cnt = InvCount(ITEM_AMULET); res[6].col = RGB(0xE0,0xB0,0x40);
-      TextL(hdc, rx, ry - 18, L"\x0420\x0435\x0441\x0443\x0440\x0441\x044b", RGB(0xC8,0x9A,0x3E), g_fSmall);
+      TextL(hdc, rx, ry - 18, L"\x0421\x0443\x043c\x043a\x0430", RGB(0xC8,0x9A,0x3E), g_fSmall);   /* v0.25: "bag", not "resources" */
       for (i = 0; i < 7; i++) {
           RECT rr = { rx, ry + i * 44, rx + 320, ry + i * 44 + 40 };
-          br = CreateSolidBrush(RGB(0x18,0x14,0x10));
+          /* v0.25: gold highlight when the mouse hovers the row */
+          int hov = (g_mouseX >= rr.left && g_mouseX < rr.right &&
+                     g_mouseY >= rr.top  && g_mouseY < rr.bottom);
+          br = CreateSolidBrush(RGB(hov?0x2A:0x18, hov?0x24:0x14, hov?0x18:0x10));
           FillRect(hdc, &rr, br); DeleteObject(br);
-          DrawFrameAt(hdc, rr, RGB(0x6A,0x50,0x28));
+          DrawFrameAt(hdc, rr, hov ? RGB(0xFF,0xE9,0x7A) : RGB(0x6A,0x50,0x28));
           { RECT ir = { rr.left + 4, rr.top + 4, rr.left + 36, rr.bottom - 4 };
             if (res[i].id == 0) {
                 FillCircle(hdc, (ir.left+ir.right)/2, (ir.top+ir.bottom)/2, 12, res[i].col);
@@ -1995,7 +2032,16 @@ static void PaintInventory(HDC hdc)
         if (g_inv[i].id) {
             const ItemDef* d = Item(g_inv[i].id);
             RECT ir = { cx + 8, cy + 8, cx + cell - 12, cy + cell - 12 };
+            /* v0.25: gold frame when the mouse hovers this slot */
+            if (g_mouseX >= sr.left && g_mouseX < sr.right &&
+                g_mouseY >= sr.top  && g_mouseY < sr.bottom)
+                DrawFrameAt(hdc, sr, RGB(0xFF,0xE9,0x7A));
             DrawItemIcon(hdc, ir, d->id, d->col);
+            /* v0.25: worn items carry a gold "Н" badge — visible at a glance
+               which stack is already equipped. */
+            if (IsEquipped(d->id))
+                TextR(hdc, sr.right - 4, sr.bottom - 16, L"\x041d",
+                      RGB(0xFF,0xE9,0x7A), g_fSmall);
             if (d->wcls || (d->id >= ITEM_HEAVY && d->id <= ITEM_MANTLE) || d->id == ITEM_AMULET)
                 DrawFrameAt(hdc, ir, RGB(0xFF,0xE9,0x7A));
             SafeWfmt(b, 48, L"%d", g_inv[i].count);
@@ -2511,16 +2557,34 @@ static void PaintWorld(HDC hdc)
         SafeWfmt(b, 160, L"%ls %ls", Q_TITLE, qtxt);
         TextC(hdc, WIN_W/2, 46, b, RGB(0x9A,0xE0,0x9A), g_fSmall, 1);
     }
-    /* v0.24: one solid bottom strip replaces the old floating legend line */
-    {
-        RECT bar = { 0, WIN_H - 26, WIN_W, WIN_H };
-        HBRUSH bb = CreateSolidBrush(RGB(0x0B,0x0E,0x16));
-        FillRect(hdc, &bar, bb); DeleteObject(bb);
-        HPEN bp = CreatePen(PS_SOLID, 1, RGB(0xC8,0x9A,0x3E));
-        { HPEN o=(HPEN)SelectObject(hdc,bp); MoveToEx(hdc,0,WIN_H-26,NULL);
-          LineTo(hdc,WIN_W,WIN_H-26); SelectObject(hdc,o);} DeleteObject(bp);
-        TextC(hdc, WIN_W/2, WIN_H - 19, W_HINT, RGB(0x9A,0xAA,0xC0), g_fSmall, 1);
-    }
+    /* v0.25: legend removed entirely — the bottom strip is now the XP bar */
+    { int bx = 14, by = WIN_H - 22, bw = WIN_W - 28, bh = 14;
+      RECT full = { 0, WIN_H - 30, WIN_W, WIN_H };
+      HBRUSH bg = CreateSolidBrush(RGB(0x0B,0x0E,0x16));
+      FillRect(hdc, &full, bg); DeleteObject(bg);
+      HPEN bp = CreatePen(PS_SOLID, 1, RGB(0xC8,0x9A,0x3E));
+      { HPEN o=(HPEN)SelectObject(hdc,bp); MoveToEx(hdc,0,WIN_H-30,NULL);
+        LineTo(hdc,WIN_W,WIN_H-30); SelectObject(hdc,o);} DeleteObject(bp);
+      br = CreateSolidBrush(RGB(0x18,0x1C,0x28));
+      FillRect(hdc, &((RECT){bx,by,bx+bw,by+bh}), br); DeleteObject(br);
+      { int need = XpNeed(g_level), wpx;
+        if (g_profReady && g_level < 5) g_profReady = 1;   /* keep flag sane */
+        if (g_level >= 5) g_profReady = 1;                 /* unlocked for good */
+        if (need < 1) need = 1;
+        if (g_xp > need) g_xp = need;
+        wpx = (int)((double)bw * g_xp / need);
+        if (wpx > 0) {
+            RECT xr = { bx, by, bx + wpx, by + bh };
+            HBRUSH xb = CreateSolidBrush(RGB(0x3E,0xB4,0x56));
+            FillRect(hdc, &xr, xb); DeleteObject(xb);
+        }
+        { RECT fr = { bx, by, bx+bw, by+bh };
+          DrawFrameAt(hdc, fr, RGB(0x6A,0x50,0x28)); }
+        SafeWfmt(b, 160, L"\x041e\x043f\x044b\x0442: %d/%d \x00b7 \x0423\x0440. %d%s",
+                 g_xp, need, g_level,
+                 (g_quest == 5 && !g_youngster) ? L"" :
+                 (g_level < 5 ? L" \x00b7 \x0441\x0442\x0435\x0437\x044f \x0441 5-\x0433\x043e" : L" \x00b7 \x0441\x0442\x0435\x0437\x044f \x043e\x0442\x043a\x0440\x044b\x0442\x0430"));
+        TextC(hdc, WIN_W/2, by + 1, b, RGB(0xE8,0xF0,0xD8), g_fSmall, 1); } }
     (void)r;
 }
 
@@ -2661,7 +2725,10 @@ static void EnterWorld(HWND hwnd)
         ShowDialogTop(D_CAT_Q1);          /* "collect 3 acorns under the oak" */
         InvAdd(ITEM_POTION, 2);
         g_quest = 2;
-        RespawnAcorns();                  /* acorns lie under the oak right now */
+        /* v0.25 FIX: full restock (RespawnAcorns above ran BEFORE the auto
+           greet bumped the quest to 2, so its self-heal never fired) — this
+           is why a fresh hero saw an empty oak until a game restart. */
+        memset(g_acorns_arr, 0, sizeof(g_acorns_arr));
     }
     SaveProfile(); /* real-time: entering the world is persisted instantly */
 }
@@ -2680,6 +2747,7 @@ static void TryPickAcorn(HWND hwnd)
     g_acorns_arr[best].taken = 1;
     g_acorns++;
     InvAdd(ITEM_ACORN, 1);
+    AddXp(5);   /* v0.25: XP for every acorn — fills the bottom experience bar */
     /* BUGFIX v0.9: the acorn task used to jump straight to "report to cat"
        without any feedback — now every acorn shows a counter and finishing
        all three fires the completion toast immediately. */
@@ -2744,8 +2812,22 @@ static void RespawnAcorns(void)
        already — physically impossible for one hero, so it can only mean
        foreign state. The oak restocks => both players always find their
        own acorns right after taking the cat's task. */
-    if (allTaken || (g_quest == 2 && g_acorns != CountTakenAcorns()))
+    if (allTaken || (g_quest == 2 && g_acorns != CountTakenAcorns())
+        /* v0.25 FIX: the acorn counter can also lag behind the bag itself —
+           e.g. a freshly greeted hero whose first SaveProfile raced with the
+           second client, or a profile written before "acornTaken" existed.
+           Any mismatch between flags and the actual bag means foreign or
+           stale state => restock the oak so acorns appear right after the
+           cat's task WITHOUT restarting the game. */
+        || (g_quest == 2 && InvCount(ITEM_ACORN) > CountTakenAcorns()))
         memset(g_acorns_arr, 0, sizeof(g_acorns_arr));
+    /* v0.25: while the acorn task is active the oak must ALWAYS show its
+       three acorns unless this very hero already picked them (bag count). */
+    if (g_quest == 2) {
+        int have = InvCount(ITEM_ACORN);
+        for (i = 0; i < 3; i++)
+            if (g_acorns_arr[i].taken && i >= have) g_acorns_arr[i].taken = 0;
+    }
 }
 
 /* v0.7: 5-second quest-completion popup (top-center, above the HUD strip) */
@@ -2934,7 +3016,16 @@ static void TalkCat(HWND hwnd)
             InvAdd(ITEM_POTION, 2);
             g_quest = 2;
             RespawnAcorns();     /* make sure the 3 acorns lie under the oak */
+            /* v0.25 FIX #1: the auto-greet inside EnterWorld advances the quest
+               to 2 WITHOUT restocking the oak (RespawnAcorns ran before that).
+               A fresh hero saw an empty tree until restart. Force a full
+               restock here — right when the task is handed out. */
+            memset(g_acorns_arr, 0, sizeof(g_acorns_arr));
+            { wchar_t ab[96];
+              SafeWfmt(ab, 96, L"\x25c6 \x041f\x043e\x0440\x0443\x0447\x0435\x043d\x0438\x0435: \x0441\x043e\x0431\x0440\x0430\x0442\x044c \x0436\x0435\x043b\x0443\x0434\x0438 \x043f\x043e\x0434 \x0434\x0443\x0431\x043e\x043c");
+              Toast(ab); }
             SaveProfile();
+            InvalidateRect(hwnd, NULL, FALSE);
             return;
         case 2:
             if (g_acorns >= 3) {
@@ -3021,6 +3112,7 @@ static void TalkSmith(HWND hwnd)
                player sees feedback immediately. */
             if (g_quest == 3) g_quest = 4;       /* task 2 -> report to the cat */
             EarnGroshi(20, L"\x041f\x043e\x0440\x0443\x0447\x0435\x043d\x0438\x0435 2");
+            AddXp(30);   /* v0.25 */
             Toast(TST_Q2_DONE);
             SaveProfile();
         } else {
@@ -3062,6 +3154,7 @@ static void TalkMarya(HWND hwnd)
             ShowDialogTop(D_MARYA_GIVE);         /* Marya's reply to the cloth */
             if (g_quest == 4) g_quest = 5;       /* all 3 done -> cat offers profession */
             EarnGroshi(20, L"\x041f\x043e\x0440\x0443\x0447\x0435\x043d\x0438\x0435 3");
+            AddXp(30);   /* v0.25 */
             Toast(TST_Q3_DONE);                  /* v0.8: instant feedback */
             SaveProfile();
         } else {

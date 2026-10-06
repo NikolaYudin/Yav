@@ -194,6 +194,13 @@ static void TalkSmith(HWND hwnd);
 static void TalkMarya(HWND hwnd);
 static void ChooseProfession(HWND hwnd, int idx);
 
+/* v0.28 forward decls (shop window + rank helpers) */
+static void EarnGroshi(int n, const wchar_t* why);
+static int  ShopBuy(HWND hwnd, int which);
+static void PaintGroveSpot(HDC hdc);
+static int  ItemRankMinLvl(int id);
+static int  RankGateMsg(int id, wchar_t* out, int cap);
+
 /* Player / world state (server-authoritative model mirrored locally) */
 static wchar_t g_nick[64] = L"";
 static int  g_px = 320, g_py = 380;          /* player pos in client units */
@@ -282,6 +289,14 @@ static const ItemDef* Item(int id) { int i; for (i=1;i<NITEMS;i++) if (g_items[i
 typedef struct { int id, count; } Slot;
 static Slot  g_inv[INV_CAP];
 static int   g_equipW = 0, g_equipA = 0, g_equipR = 0;   /* item ids or 0 */
+
+/* v0.28: Yaga's shop window (left panel) + session income/spend counters */
+static int   g_shopOpen = 0;
+static int   g_incomeSess = 0, g_spendSess = 0;
+static RECT  g_shopBuyRects[2], g_shopSellRects[8];
+static int   g_shopSellN = 0;
+static RECT  g_shopLeaveRect = { 0,0,0,0 };
+#define SHOP_SEL_MAX 6   /* sellable resource kinds shown as cells */
 static int   g_invOpen = 0;
 /* v0.24: character sheet (TAB) per the UI prompt + single bottom strip */
 static int   g_charOpen = 0;
@@ -296,6 +311,31 @@ static int   g_level = 1, g_profBonus = 0;              /* profession bonus */
 static int   g_xp = 0;
 static int   g_profReady = 0;               /* v0.25: LVL 5 reached -> stezha unlocked */
 static int   XpNeed(int lvl) { return 50 + (lvl - 1) * 30; }
+/* v0.28: item ranks — Я(0) no grade (stezha gift), Д(1) from LVL 5, Г(2) from LVL 20 */
+static const wchar_t* RankLetter(int r)
+{
+    switch (r) { case 1: return L"\x0414"; case 2: return L"\x0413"; default: return L"\x042f"; }
+}
+static int ItemRankMinLvl(int id)
+{
+    if (id >= ITEM_BULAVA && id <= ITEM_MANTLE) return g_level >= 5 ? 1 : 0;
+    return 0;
+}
+/* returns 1 and fills `out` when the hero may not equip this rank yet */
+static int RankGateMsg(int id, wchar_t* out, int cap)
+{
+    int min = ItemRankMinLvl(id);
+    if (min > 0 && g_level < 5) {
+        /* "Ранг %ls — с 5-го уровня" */
+        SafeWfmt(out, cap,
+            L"\x0420\x0430\x043d\x0433\x0435\x043d\x0438\x0435\x043c %ls \x2014 "
+            L"\x0441\x0442\x0430\x043d\x0435\x0442 \x0442\x043e\x043b\x044c\x043a\x043e "
+            L"\x0441\x0020\x0035-\x0433\x043e \x0443\x0440\x043e\x0432\x043d\x044f",
+            RankLetter(min));
+        return 1;
+    }
+    return 0;
+}
 static void  AddXp(int amount);             /* forward decl (defined near Toast) */
 static int   g_prof = -1;                               /* v0.19: 0 Воин / 1 Лучник / 2 Волхв, -1 ещё не избрана */
 static int   g_youngster = 1;                           /* 1 = молодец, 0 = истый герой */
@@ -563,7 +603,14 @@ static void DialogFmt(const wchar_t* tmpl, const wchar_t* a, int n)
 static int ToggleEquip(HWND hwnd, int id)
 {
     const ItemDef* d = Item(id);
+    wchar_t gate[160];
     if (!d) return 0;
+    /* v0.28: rank gate — Д-rank gear needs LVL 5 (Г-rank will need LVL 20) */
+    if (!IsEquipped(id) && RankGateMsg(id, gate, 160)) {
+        ShowDialogTop(gate);
+        InvalidateRect(hwnd, NULL, FALSE);
+        return 0;
+    }
     if (IsEquipped(id)) {                        /* unequip -> back to bag */
         if (g_equipW == id) g_equipW = 0;
         if (g_equipA == id) g_equipA = 0;
@@ -941,7 +988,10 @@ static void EarnGroshi(int n, const wchar_t* why)
 {
     wchar_t t[160];
     g_groshi += n;
-    SafeWfmt(t, 160, L"+%d \x0433\x0440\x043e\x0448\x0435\x0439 \x00b7 %ls", n, why);
+    if (n > 0) g_incomeSess += n;          /* v0.28: green income counter */
+    else       g_spendSess  += -n;         /* red spend counter */
+    SafeWfmt(t, 160, L"%s%d \x0433\x0440\x043e\x0448\x0435\x0439 \x00b7 %ls",
+             n >= 0 ? L"+" : L"-", n < 0 ? -n : n, why);
     Toast(t);
 }
 
@@ -959,8 +1009,8 @@ static void QuestDoneReward(int n, const wchar_t* qname)
 static void QuestCompleteToast(int n, int coins, const wchar_t* doneMsg)
 {
     wchar_t b[192];
-    g_groshi += coins;
-    AddXp(25);
+    g_groshi += coins; g_incomeSess += coins;   /* v0.28: green counter */
+    AddXp(40);                                  /* v0.28: quest XP tuned to LVL 4.5 */
     SafeWfmt(b, 192, L"\x2726 %ls \x00b7 +%d \x0433\x0440\x043e\x0448\x0435\x0439", doneMsg, coins);
     Toast(b);
     SaveProfile();
@@ -1000,7 +1050,7 @@ static int ShopBuy(HWND hwnd, int which)   /* 1 hp-potion, 2 energy-potion */
         ShowDialogTop(L"\x0421\x0443\x043c\x043a\x0430 \x043f\x043e\x043b\x043d\x0430 \u2014 \x043d\x0435\x0447\x0435\x0433\x043e \x043f\x043e\x043b\x043e\x0436\x0438\x0442\x044C!");
         return 0;
     }
-    g_groshi -= price;
+    g_groshi -= price; g_spendSess += price;   /* v0.28: red spend counter */
     lstrcpynW(g_speaker, L"\x042f\x0433\x0430", 64);
     if (which == 1)
         SafeWfmt(d, 160, L"\x0417\x0435\x043b\x044C\x0435 \x0431\x043E\x0434\x0440\x044F\x0448\x0435\x0435 \u2014 %d \x0433\x0440\x043e\x0448\x0435\x0439. \x041d\x0430 \x0437\x0434\x043e\x0440\x043E\x0432\x044C\x0435!", price);
@@ -2866,7 +2916,8 @@ static void EnterWorld(HWND hwnd)
     }
     if (g_quest == 1) {
         ShowDialogTop(D_CAT_Q1);          /* "collect 3 acorns under the oak" */
-        InvAdd(ITEM_POTION, 2);
+        /* v0.28: the bag starts EMPTY — starter potions were handed out by
+           mistake here ("сумка при старте должна быть пустой"). */
         g_quest = 2;
         /* v0.25 FIX: full restock (RespawnAcorns above ran BEFORE the auto
            greet bumped the quest to 2, so its self-heal never fired) — this
@@ -2890,7 +2941,7 @@ static void TryPickAcorn(HWND hwnd)
     g_acorns_arr[best].taken = 1;
     g_acorns++;
     InvAdd(ITEM_ACORN, 1);
-    AddXp(5);   /* v0.25: XP for every acorn — fills the bottom experience bar */
+    AddXp(10);  /* v0.28: +10 XP per acorn — 3 tasks bring the hero to ~LVL 4.5 */
     /* BUGFIX v0.9: the acorn task used to jump straight to "report to cat"
        without any feedback — now every acorn shows a counter and finishing
        all three fires the completion toast immediately. */
@@ -3154,9 +3205,8 @@ static void TalkCat(HWND hwnd)
             return; }
         case 1:
             ShowDialogTop(D_CAT_Q1);
-            /* starter kit: potion only — metal/cloth are gathered in the world
-               (acorns respawn under the oak, grove spot gives metal & cloth) */
-            InvAdd(ITEM_POTION, 2);
+            /* v0.28: no starter items at all — the bag stays empty until the
+               hero earns things in the world (acorns/grove loot/Yaga shop) */
             g_quest = 2;
             RespawnAcorns();     /* make sure the 3 acorns lie under the oak */
             /* v0.25 FIX #1: the auto-greet inside EnterWorld advances the quest
@@ -3211,7 +3261,20 @@ static void TalkCat(HWND hwnd)
         case 4:
             /* reporting on task 3: Marya wove the garment already? */
             if (g_maryaStage >= 3 || InvCount(ITEM_HEAVY) > 0) {
-                g_maryaStage = 3; g_quest = 5;
+                g_maryaStage = 3;
+                if (g_level < 5) {             /* v0.28: stezha opens at LVL 5 */
+                    wchar_t wait[160];
+                    SafeWfmt(wait, 160,
+                        L"\x041c\x043e\x043b\x043e\x0434\x0435\x0446, \x0441\x0442\x0435\x0437\x044e "
+                        L"\x0441\x0442\x0435\x043b\x0435\x043c \x0442\x043e\x043b\x044c\x043a\x043e "
+                        L"\x043d\x0430 5-\x043c \x0443\x0440\x043e\x0432\x043d\x0435. "
+                        L"\x0421\x043e\x0431\x0435\x0440\x0438 \x0436\x0435\x043b\x0443\x0434\x0438 "
+                        L"\x0438\x043b\x0438 \x043f\x0440\x0438\x043f\x0430\x0441\x044b \x0443 "
+                        L"\x042f\x0433\x0438 \u2014 \x043e\x043f\x044b\x0442 \x0440\x0430\x0441\x0442\x0435\x0442.");
+                    ShowDialogTop(wait);
+                    SaveProfile(); return;
+                }
+                g_quest = 5;                   /* gate passed -> final report */
                 ShowDialogTop(D_CAT_FINAL);
                 g_screen = SCR_PROF;           /* open profession choice overlay */
                 LayoutForScreen(hwnd);
@@ -3221,6 +3284,15 @@ static void TalkCat(HWND hwnd)
             SaveProfile();
             return;
         case 5:
+            if (g_level < 5) {                 /* v0.28: keep gating until LVL 5 */
+                wchar_t wait[160];
+                SafeWfmt(wait, 160,
+                    L"\x041d\x0435 \x0441\x043f\x0435\x0448\x0438 \x0431\x044b\x0441\x0442\x0440\x043e: "
+                    L"\x0441\x0442\x0435\x0437\x044e \u2014 \x043d\x0430 5-\x043c \x0443\x0440\x043e\x0432\x043d\x0435 "
+                    L"(\x0442\x0435\x043f\x0435\x0440\x044c %d).", g_level);
+                ShowDialogTop(wait);
+                return;
+            }
             ShowDialogTop(D_CAT_FINAL);
             g_screen = SCR_PROF;           /* open profession choice overlay */
             LayoutForScreen(hwnd);
@@ -3255,7 +3327,7 @@ static void TalkSmith(HWND hwnd)
                player sees feedback immediately. */
             if (g_quest == 3) g_quest = 4;       /* task 2 -> report to the cat */
             EarnGroshi(20, L"\x041f\x043e\x0440\x0443\x0447\x0435\x043d\x0438\x0435 2");
-            AddXp(30);   /* v0.25 */
+            AddXp(40);   /* v0.28: tuned */
             Toast(TST_Q2_DONE);
             SaveProfile();
         } else {
@@ -3297,7 +3369,7 @@ static void TalkMarya(HWND hwnd)
             ShowDialogTop(D_MARYA_GIVE);         /* Marya's reply to the cloth */
             if (g_quest == 4) g_quest = 5;       /* all 3 done -> cat offers profession */
             EarnGroshi(20, L"\x041f\x043e\x0440\x0443\x0447\x0435\x043d\x0438\x0435 3");
-            AddXp(30);   /* v0.25 */
+            AddXp(40);   /* v0.28: tuned */
             Toast(TST_Q3_DONE);                  /* v0.8: instant feedback */
             SaveProfile();
         } else {
@@ -3342,6 +3414,12 @@ static void ChooseProfession(HWND hwnd, int idx)
     g_energyMax += 5; g_energyCur = g_energyMax;
     g_quest = 6;
     pnames[0] = PR_WARRIOR; pnames[1] = PR_HUNTER; pnames[2] = PR_MAGUS;
+    /* v0.28: the smith's gift on choosing a stezha — no-grade (rank Я) weapon
+       and armor of the chosen path, plus the Д-rank set unlocked from LVL 5. */
+    { int wid = idx == 0 ? ITEM_BULAVA : idx == 1 ? ITEM_LUKO : ITEM_POSOH;
+      int aid = idx == 0 ? ITEM_HEAVY  : idx == 1 ? ITEM_LEATHER : ITEM_MANTLE;
+      if (InvCount(wid) == 0) InvAdd(wid, 1);
+      if (InvCount(aid) == 0) InvAdd(aid, 1); }
     SafeWfmt(b, 256, D_PROF_DONE, pnames[idx]);
     Toast(TST_PROF_UP);
     BuildAbilities();
